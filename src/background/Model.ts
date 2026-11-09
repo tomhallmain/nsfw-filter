@@ -1,17 +1,34 @@
-import { NSFWJS, PredictionType } from 'nsfwjs/core'
+import type { NSFWJS, PredictionType } from 'nsfwjs/core'
 
 import { ILogger } from '../utils/Logger'
+
+import type { FrameSignature } from './classifier/autoDlFrames'
+import { blockedResult, ClassificationResult, visibleResult } from './classifier/ClassificationResult'
 
 export type ModelSettings = {
   filterStrictness: number
 }
 
-type IModel = {
-  predictImage: (image: HTMLImageElement, url: string) => Promise<boolean>
-  setSettings: (settings: ModelSettings) => void
+/** All NSFWJS classes, so a frame's full signature is available. */
+const NSFWJS_CLASS_COUNT = 5
+
+const NSFWJS_BORDER_COLORS: Record<string, string> = {
+  Porn: '#e11d48',
+  Hentai: '#7c3aed',
+  Sexy: '#ea580c'
 }
 
-export class Model implements IModel {
+type MediaSource = HTMLImageElement | HTMLVideoElement | HTMLCanvasElement
+
+/** One loaded set of TF.js weights, as NsfwjsMediaClassifier drives it. */
+export type FrameModel = {
+  predictMedia: (media: MediaSource, url: string) => Promise<ClassificationResult>
+  predictMediaWithSignature: (media: MediaSource, url: string) => Promise<{ result: ClassificationResult, signature: FrameSignature }>
+  setSettings: (settings: ModelSettings) => void
+  dispose?: () => void
+}
+
+export class Model implements FrameModel {
   private readonly model: NSFWJS
   private readonly logger: ILogger
 
@@ -61,33 +78,65 @@ export class Model implements IModel {
     }
   }
 
-  public async predictImage (image: HTMLImageElement, url: string): Promise<boolean> {
+  public dispose (): void {
+    this.model.dispose()
+  }
+
+  public async predictMedia (media: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement, url: string): Promise<ClassificationResult> {
+    return (await this.predictMediaWithSignature(media, url)).result
+  }
+
+  public async predictMediaWithSignature (
+    media: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement,
+    url: string
+  ): Promise<{ result: ClassificationResult, signature: FrameSignature }> {
+    const start = this.logger.status ? new Date().getTime() : 0
+
+    const prediction = await this.model.classify(media, NSFWJS_CLASS_COUNT)
+    const outcome = this.handlePrediction(prediction)
+
     if (this.logger.status) {
-      const start = new Date().getTime()
-
-      const prediction = await this.model.classify(image, 2)
-      const { result, className, probability } = this.handlePrediction(prediction)
-
       const end = new Date().getTime()
-      this.logger.log(`IMG prediction (${end - start} ms) is ${className} ${probability} for ${url}`)
+      this.logger.log(`Media prediction (${end - start} ms) is ${outcome.className} ${outcome.probability} for ${url}`)
+    }
 
-      return result
-    } else {
-      const prediction = await this.model.classify(image, 2)
-      return this.handlePrediction(prediction).result
+    return { result: outcome.result, signature: this.signatureOf(prediction) }
+  }
+
+  /** Positive score is the summed probability of the filtered classes. */
+  private signatureOf (prediction: PredictionType[]): FrameSignature {
+    let positiveScore = 0
+    for (const { className, probability } of prediction) {
+      if (this.FILTER_LIST.has(className)) positiveScore += probability
+    }
+    return {
+      positiveScore,
+      classes: prediction.map(({ className, probability }) => ({ name: className, probability }))
     }
   }
 
-  private handlePrediction (prediction: PredictionType[]): { result: boolean, className: string, probability: number } {
+  private handlePrediction (prediction: PredictionType[]): { result: ClassificationResult, className: string, probability: number } {
     const [{ className: cn1, probability: pb1 }, { className: cn2, probability: pb2 }] = prediction
 
     const result1 = this.FILTER_LIST.has(cn1) && pb1 > (this.firstFilterPercentages.get(cn1) as number)
-    if (result1) return ({ result: result1, className: cn1, probability: pb1 })
+    if (result1) {
+      return {
+        result: blockedResult(cn1, NSFWJS_BORDER_COLORS[cn1], pb1),
+        className: cn1,
+        probability: pb1
+      }
+    }
 
     const result2 = this.FILTER_LIST.has(cn2) && pb2 > (this.secondFilterPercentages.get(cn2) as number)
-    if (result2) return ({ result: result2, className: cn2, probability: pb2 })
+    if (result2) {
+      return {
+        result: blockedResult(cn2, NSFWJS_BORDER_COLORS[cn2], pb2),
+        className: cn2,
+        probability: pb2
+      }
+    }
 
-    return ({ result: false, className: cn1, probability: pb1 })
+    return ({ result: visibleResult(), className: cn1, probability: pb1 })
   }
 
   public static handleFilterStrictness ({ value, minValue, maxValue }: {value: number, minValue: number, maxValue: number}): number {

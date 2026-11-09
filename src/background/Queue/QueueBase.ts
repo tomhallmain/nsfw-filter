@@ -1,10 +1,11 @@
 import { ILogger } from '../../utils/Logger'
-import { IReduxedStorage } from '../background'
+import { ClassificationResult } from '../classifier/ClassificationResult'
+import { IUrlClassifier } from '../classifier/MediaClassifier'
+import { IReduxedStorage } from '../types'
 import { LRUCache } from '../LRUCache'
-import { OffscreenModel } from '../OffscreenModel'
 
 export type requestQueueValue = Array<Array<{
-  resolve: (value: boolean) => void
+  resolve: (value: ClassificationResult) => void
   reject: (error: Error) => void
 }>>
 
@@ -15,7 +16,7 @@ export type TabIdUrl = { tabId: number, tabUrl: string }
 export const DEFAULT_TAB_ID = 999999
 
 export class QueueBase {
-  protected readonly model: OffscreenModel
+  protected readonly model: IUrlClassifier
   protected readonly logger: ILogger
 
   protected readonly store: IReduxedStorage
@@ -23,11 +24,11 @@ export class QueueBase {
   protected activeTabId: KeyType<TabIdUrl, 'tabId'>
   protected readonly DEFAULT_TAB_ID: number
   protected readonly requestMap: Map<string, requestQueueValue>
-  protected readonly cache: LRUCache<string, boolean>
+  protected readonly cache: LRUCache<string, ClassificationResult>
 
   protected totalBlocked: number
 
-  constructor (model: OffscreenModel, logger: ILogger, store: IReduxedStorage) {
+  constructor (model: IUrlClassifier, logger: ILogger, store: IReduxedStorage) {
     this.store = store
     this.model = model
     this.logger = logger
@@ -57,9 +58,9 @@ export class QueueBase {
 
   protected _checkCurrentTabIdUrlStatus ({ tabId, tabUrl }: { tabId: number, tabUrl: string }): boolean {
     if (!this.currentTabIdUrls.has(tabId)) {
-      return false // user closed this tab id
+      return false
     } else if (this.currentTabIdUrls.has(tabId) && tabUrl !== this.currentTabIdUrls.get(tabId)) {
-      return false // user's tab id matches current tab id, but url references to an another page
+      return false
     } else {
       return true
     }

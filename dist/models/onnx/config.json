@@ -1,0 +1,27 @@
+{
+  "architecture": "resnet34",
+  "inputSize": 320,
+  "modelFile": "resnet34_model.onnx",
+  "inputName": "input",
+  "outputName": "output",
+  "layout": "NCHW",
+  "normalize": {
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225]
+  },
+  "smallImageDefaultMaxSide": 120,
+  "smallImageDefaultWeight": 0.35,
+  "classes": [
+    { "name": "class_1", "sfw": false, "borderColor": "#dc2626", "shade": "red" },
+    { "name": "class_2", "sfw": false, "borderColor": "#57534e", "shade": "stone", "smallMaxSide": 120, "smallWeight": 0.25 },
+    { "name": "drawings", "sfw": true },
+    { "name": "class_3", "sfw": false, "borderColor": "#ca8a04", "shade": "yellow" },
+    { "name": "class_4", "sfw": false, "borderColor": "#16a34a", "shade": "green" },
+    { "name": "class_5", "sfw": false, "borderColor": "#000000", "shade": "black", "smallMaxSide": 120, "smallWeight": 0.45 },
+    { "name": "neutral", "sfw": true },
+    { "name": "class_6", "sfw": false, "borderColor": "#7c3aed", "shade": "violet" },
+    { "name": "class_7", "sfw": false, "borderColor": "#db2777", "shade": "pink" },
+    { "name": "class_8", "sfw": false, "borderColor": "#2563eb", "shade": "blue" },
+    { "name": "class_9", "sfw": false, "borderColor": "#ea580c", "shade": "orange" }
+  ]
+}

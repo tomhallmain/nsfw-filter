@@ -1,146 +1,304 @@
 import { PredictionRequest } from '../../utils/messages'
+import { queryAllDeep } from '../shadowRoots'
 
-import { Filter, FilterSettings } from './Filter'
+import { applyClassBorder, clearClassBorder } from './borderFrame'
+import { applyClassTint, blurFilterForScore, clearClassTint, SWEEP_FILTER } from './blurEffect'
+import { Filter, isCrossContextBlobUrl } from './Filter'
+import { PageSensitivityThresholds, PageTally } from './pageSensitivity'
+
+/** Status of an image hidden until the browser picks its source. */
+const AWAITING_SOURCE = 'awaiting-source'
+
+/** The URL the image actually displays, which differs from `src` under srcset or <picture>. */
+const imageSource = (image: HTMLImageElement): string =>
+  image.currentSrc.length > 0 ? image.currentSrc : image.src
+
+export type MediaFilterSettingsType = {
+  filterEffect: 'blur' | 'hide' | 'grayscale'
+  /** Absent when the protection level is switched off. Ignored by VideoFilter. */
+  interImageAwareness?: PageSensitivityThresholds
+}
 
 export type IImageFilter = {
   analyzeImage: (image: HTMLImageElement, srcAttribute: boolean) => void
-  setSettings: (settings: FilterSettings) => void
+  setSettings: (settings: MediaFilterSettingsType) => void
   revealImage: (image: HTMLImageElement) => void
-  checkStyleMutation: (image: HTMLImageElement) => void
-  applyEffectToBlocked: () => void
-  revealAll: () => void
+  revealSweptImages: () => number
 }
 
 export class ImageFilter extends Filter implements IImageFilter {
   private readonly MIN_IMAGE_SIZE: number
-  // Bumped when filtering is turned off. A verdict from before that is for a page
-  // the user has since asked us to leave alone.
-  private epoch: number
-  private unhidden: WeakSet<HTMLImageElement>
+  private settings: MediaFilterSettingsType
+  /** Sticky for the life of the page view; navigation builds a new instance. */
+  private pageSensitive: boolean
+  /** Set once the user has asked to see through the sweep on this page. */
+  private sweepDismissed: boolean
+  private readonly flaggedListeners: Array<(image: HTMLImageElement) => void>
 
-  constructor () {
-    super()
+  constructor (tally?: PageTally) {
+    super(tally)
     this.MIN_IMAGE_SIZE = 41
-    this.epoch = 0
-    this.unhidden = new WeakSet()
+    this.pageSensitive = false
+    this.sweepDismissed = false
+    this.flaggedListeners = []
+
+    this.settings = { filterEffect: 'hide' }
+
+    // Blocked video moves the same counters, so the sweep has to be able to
+    // trip on a verdict no image on the page produced.
+    this.tally.onVerdict(() => this.evaluatePageSensitivity())
   }
 
-  // User-initiated unhide from the right-click menu. Clears whatever effect was
-  // applied and tags the image `sfw` so analyzeImage won't re-filter it (and a
-  // later src change re-triggers analysis as usual).
+  /** Called after an image's NSFW verdict has been applied. */
+  public onFlagged (listener: (image: HTMLImageElement) => void): void {
+    this.flaggedListeners.push(listener)
+  }
+
+  public setSettings (settings: MediaFilterSettingsType): void {
+    this.settings = settings
+  }
+
+  // User-initiated unhide from the right-click menu.
   public revealImage (image: HTMLImageElement): void {
-    this.unhidden.add(image)
-    this.revealElement(image)
+    if (image.parentNode?.nodeName === 'BODY') image.hidden = false
+    image.style.filter = ''
+    image.style.visibility = 'visible'
+    this.clearBorder(image)
+    clearClassTint(image)
     image.dataset.nsfwFilterStatus = 'sfw'
+    delete image.dataset.nsfwFilterClass
   }
 
-  public analyzeImage (image: HTMLImageElement, srcAttribute: boolean = false): void {
-    // Only (re)process unseen images or images whose `src` just changed.
-    if (!srcAttribute && image.dataset.nsfwFilterStatus !== undefined) return
-    // A different image in the same element: the unhide the user gave the old one
-    // does not carry over.
-    if (srcAttribute) this.unhidden.delete(image)
-    if (image.src.length === 0) {
-      // An image whose src is cleared while a prediction is in flight would keep
-      // its `processing` tag and inline visibility:hidden forever: the pending
-      // result is for the old src, so showImage's url guard skips it. Reveal it —
-      // an empty image has nothing to filter, and a later real src re-triggers
-      // analysis via srcAttribute.
-      if (image.dataset.nsfwFilterStatus === 'processing') this.revealImage(image)
-      return
-    }
+  /**
+   * Undo the page-wide sweep for this page view and report how many images came
+   * back. Individually flagged images keep their treatment: the sweep is the
+   * only thing being dismissed. Stays dismissed until the page is left, so
+   * verdicts still arriving cannot re-trip what the user just cleared.
+   */
+  public revealSweptImages (): number {
+    this.sweepDismissed = true
+    this.pageSensitive = false
 
-    // Images laid out smaller than MIN_IMAGE_SIZE in either dimension aren't
-    // filtered (icons, spacers, and the like), but they still need a status tag
-    // so the pending-hide stylesheet reveals them. A zero width or height means
-    // "not laid out yet", which is still a candidate.
-    const tooSmall =
-      image.width !== 0 && image.height !== 0 &&
-      (image.width <= this.MIN_IMAGE_SIZE || image.height <= this.MIN_IMAGE_SIZE)
-    if (tooSmall) {
-      // Reveal when untagged or when the src changed to a small icon mid-flight:
-      // the in-flight result is for the old src, so showImage's url guard would
-      // skip it and leave the image stuck hidden. A blocked image stays blocked.
-      const status = image.dataset.nsfwFilterStatus
-      if (status === undefined || status === 'processing') this.revealImage(image)
-      return
-    }
-
-    image.dataset.nsfwFilterStatus = 'processing'
-    this._analyzeImage(image)
-  }
-
-  // Some sites (Instagram, Google) rewrite an image's inline style on every
-  // re-render, wiping the effect we applied so a blocked image reappears. When
-  // the page clears the effect on a still-blocked image, put it back. The
-  // effect-intact check keeps this from looping against our own style writes.
-  public checkStyleMutation (image: HTMLImageElement): void {
-    const status = image.dataset.nsfwFilterStatus
-    // An in-flight image is hidden only by our inline visibility; a restyle wipes
-    // it. Keep it hidden (not revealed-with-effect: it isn't classified yet) until
-    // the prediction returns and either reveals or blocks it.
-    if (status === 'processing') {
-      if (image.style.visibility !== 'hidden') this.hideElement(image)
-      return
-    }
-    if (status !== 'nsfw') return
-    if (this.isEffectApplied(image)) return
-    this.applyEffect(image)
-  }
-
-  // A live filterEffect change (blur -> grayscale -> hide) doesn't alter the
-  // NSFW verdict, only how it's shown, so re-render every already-blocked image
-  // from the current setting instead of reclassifying. applyEffect clears the
-  // other modes' styles, so switching modes doesn't leave a stale blur behind.
-  public applyEffectToBlocked (): void {
-    const blocked = document.querySelectorAll<HTMLImageElement>('img[data-nsfw-filter-status="nsfw"]')
-    blocked.forEach(image => this.applyEffect(image))
-  }
-
-  // Live pause / allow-list of the current page: bring back every image we
-  // touched. Clearing the status (not tagging sfw) means a later re-enable's
-  // sweep reclassifies them rather than trusting a verdict made while off.
-  public revealAll (): void {
-    this.epoch++
-    // Dropping the user's unhides too: kept, they would discard the verdict for
-    // an image re-enabled filtering has already hidden.
-    this.unhidden = new WeakSet()
-
-    const filtered = document.querySelectorAll<HTMLImageElement>('img[data-nsfw-filter-status]')
-    filtered.forEach(image => {
-      this.revealElement(image)
-      delete image.dataset.nsfwFilterStatus
+    const swept = queryAllDeep<HTMLImageElement>(
+      'img[data-nsfw-filter-status="page-sensitive"]'
+    )
+    swept.forEach(image => {
+      image.style.filter = ''
+      image.dataset.nsfwFilterStatus = 'sfw'
     })
+
+    return swept.length
   }
 
-  private _analyzeImage (image: HTMLImageElement): void {
-    this.hideElement(image)
+  public analyzeImage (image: HTMLImageElement, _srcAttribute: boolean = false): void {
+    const status = image.dataset.nsfwFilterStatus
 
-    // A verdict applies to the src it was asked about, on a page still being
-    // filtered. Filtering can be switched off and the src can change while the
-    // request is out, and hiding on a late verdict is not recoverable from.
-    const epoch = this.epoch
-    const request = new PredictionRequest(image.src)
+    if (!this.isLargeEnough(image)) {
+      if (status === AWAITING_SOURCE) this.releaseHold(image)
+      return
+    }
+
+    if (this.awaitsSourceSelection(image)) {
+      this.holdUntilLoaded(image, status)
+      return
+    }
+
+    const source = imageSource(image)
+    if (source.length === 0) {
+      if (status === AWAITING_SOURCE) this.releaseHold(image)
+      return
+    }
+
+    const judged = status !== undefined && status !== 'error' && status !== AWAITING_SOURCE
+    if (source === image.dataset.nsfwFilterSrc && judged) return
+
+    if (status === 'nsfw' || status === 'page-sensitive') this.clearAppliedEffect(image)
+
+    if (isCrossContextBlobUrl(source)) {
+      this.markUnsupported(image, source)
+      return
+    }
+
+    image.dataset.nsfwFilterSrc = source
+    image.dataset.nsfwFilterStatus = 'processing'
+    this._analyzeImage(image, source)
+  }
+
+  /** Width and height of 0 mean not yet known, not too small. */
+  private isLargeEnough (image: HTMLImageElement): boolean {
+    return (image.width > this.MIN_IMAGE_SIZE && image.height > this.MIN_IMAGE_SIZE) ||
+      image.height === 0 ||
+      image.width === 0
+  }
+
+  /**
+   * The displayed picture comes from `srcset` or a <picture> <source>, but the
+   * browser has not chosen it yet (a lazy image stays unchosen until it nears
+   * the viewport). `src` is then only a fallback, often a placeholder, so the
+   * image waits for its `load` event instead of being judged by it.
+   */
+  private awaitsSourceSelection (image: HTMLImageElement): boolean {
+    return image.currentSrc.length === 0 &&
+      (image.hasAttribute('srcset') || image.parentElement?.nodeName === 'PICTURE')
+  }
+
+  /**
+   * Hidden by visibility only: the `hidden` attribute is display: none, and an
+   * element with no box is never lazy-loaded, so it would wait forever.
+   */
+  private holdUntilLoaded (image: HTMLImageElement, status: string | undefined): void {
+    if (status === 'nsfw' || status === 'page-sensitive') this.clearAppliedEffect(image)
+    image.dataset.nsfwFilterStatus = AWAITING_SOURCE
+    image.style.visibility = 'hidden'
+  }
+
+  private releaseHold (image: HTMLImageElement): void {
+    delete image.dataset.nsfwFilterStatus
+    image.style.visibility = 'visible'
+  }
+
+  private _analyzeImage (image: HTMLImageElement, source: string): void {
+    this.hideImage(image)
+
+    const mediaType = this.isGifUrl(source) ? 'gif' : 'image'
+    const request = new PredictionRequest(source, mediaType)
     this.requestToAnalyzeImage(request)
-      .then(({ result, url }) => {
-        if (this.epoch !== epoch || image.src !== url || this.unhidden.has(image)) return
+      .then(response => {
+        // The image moved on to another source while this one was judged; the
+        // newer source has its own request, and this verdict says nothing about it.
+        if (imageSource(image) !== response.url) return
 
+        if (response.failed) {
+          this.markUnclassified(image, response.url)
+          return
+        }
+
+        const { result, url, borderColor, topNsfwClass, score } = response
         if (result) {
-          this.blockedItems++
-          image.dataset.nsfwFilterStatus = 'nsfw'
-          this.applyEffect(image)
+          if (this.settings.filterEffect === 'blur') {
+            image.style.filter = blurFilterForScore(score)
+            this.applyBorder(image, borderColor)
+            applyClassTint(image, borderColor, score)
+            this.showImage(image, url, 'nsfw', topNsfwClass)
+          } else if (this.settings.filterEffect === 'grayscale') {
+            image.style.filter = 'grayscale(1)'
+            this.applyBorder(image, borderColor)
+            clearClassTint(image)
+            this.showImage(image, url, 'nsfw', topNsfwClass)
+          } else {
+            // hide: no border (element not shown)
+            image.dataset.nsfwFilterStatus = 'nsfw'
+            if (topNsfwClass !== undefined) image.dataset.nsfwFilterClass = topNsfwClass
+          }
+
+          this.recordVerdict(true)
+          this.evaluatePageSensitivity()
+          this.flaggedListeners.forEach(listener => listener(image))
         } else {
-          this.showImage(image)
+          this.recordVerdict(false)
+          this.evaluatePageSensitivity()
+          this.clearBorder(image)
+          clearClassTint(image)
+          this.showImage(image, url, this.pageSensitive ? 'page-sensitive' : 'sfw')
         }
       }).catch(({ url }) => {
-        if (this.epoch !== epoch || image.src !== url) return
-
-        this.showImage(image)
+        this.markUnclassified(image, url)
       })
   }
 
-  private showImage (image: HTMLImageElement): void {
-    image.dataset.nsfwFilterStatus = 'sfw'
-    this.revealElement(image)
+  /**
+   * An element being re-analysed for a new source still carries the previous
+   * source's effect, which no later verdict path removes. Lazy-loaders and
+   * modal viewers reuse one <img> across pictures.
+   */
+  private clearAppliedEffect (image: HTMLImageElement): void {
+    image.style.filter = ''
+    this.clearBorder(image)
+    clearClassTint(image)
+    delete image.dataset.nsfwFilterClass
+  }
+
+  /**
+   * No verdict was reached. The image is shown, but recorded as unjudged so it
+   * stays eligible for another attempt -- writing 'sfw' here would be
+   * indistinguishable from a real verdict and would never be revisited.
+   */
+  private markUnclassified (image: HTMLImageElement, url: string): void {
+    this.clearBorder(image)
+    clearClassTint(image)
+    this.showImage(image, url, 'error')
+    this.retryAfterFailure(image, () => this.analyzeImage(image, false))
+  }
+
+  /**
+   * A blob: source can never be classified -- see `isCrossContextBlobUrl`.
+   * Unlike a transient failure, this never retries: shown unfiltered and
+   * left alone until the src genuinely changes.
+   */
+  private markUnsupported (image: HTMLImageElement, source: string): void {
+    this.clearBorder(image)
+    clearClassTint(image)
+    image.dataset.nsfwFilterSrc = source
+    image.dataset.nsfwFilterStatus = 'error'
+    delete image.dataset.nsfwFilterClass
+    if (image.parentNode?.nodeName === 'BODY') image.hidden = false
+    image.style.visibility = 'visible'
+  }
+
+  /**
+   * Enough of the page came back positive to treat the page itself as unsafe,
+   * so images the classifier individually cleared get swept behind a blur too.
+   * Images still in flight are picked up as their own verdicts land.
+   */
+  private evaluatePageSensitivity (): void {
+    const thresholds = this.settings.interImageAwareness
+    if (thresholds === undefined || this.pageSensitive || this.sweepDismissed) return
+    if (!this.tally.isSensitive(thresholds)) return
+
+    this.pageSensitive = true
+
+    const cleared = queryAllDeep<HTMLImageElement>('img[data-nsfw-filter-status="sfw"]')
+    cleared.forEach(image => {
+      image.dataset.nsfwFilterStatus = 'page-sensitive'
+      image.style.filter = SWEEP_FILTER
+    })
+  }
+
+  private hideImage (image: HTMLImageElement): void {
+    if (image.parentNode?.nodeName === 'BODY') image.hidden = true
+
+    image.style.visibility = 'hidden'
+  }
+
+  private showImage (
+    image: HTMLImageElement,
+    url: string,
+    status: 'sfw' | 'nsfw' | 'error' | 'page-sensitive' = 'sfw',
+    topNsfwClass?: string
+  ): void {
+    if (imageSource(image) === url) {
+      if (image.parentNode?.nodeName === 'BODY') image.hidden = false
+
+      image.dataset.nsfwFilterStatus = status
+      if (status === 'page-sensitive') image.style.filter = SWEEP_FILTER
+      if (status === 'nsfw' && topNsfwClass !== undefined) {
+        image.dataset.nsfwFilterClass = topNsfwClass
+      } else {
+        delete image.dataset.nsfwFilterClass
+      }
+      image.style.visibility = 'visible'
+    }
+  }
+
+  private applyBorder (image: HTMLImageElement, borderColor?: string): void {
+    applyClassBorder(image, borderColor)
+  }
+
+  private clearBorder (image: HTMLImageElement): void {
+    clearClassBorder(image)
+  }
+
+  private isGifUrl (url: string): boolean {
+    return /\.gif(\?.*)?$/i.test(url)
   }
 }

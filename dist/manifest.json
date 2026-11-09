@@ -6,8 +6,12 @@
   "homepage_url": "https://nsfw-filter.com",
   "permissions": [
     "storage",
+    "tabs",
     "offscreen",
     "contextMenus"
+  ],
+  "optional_permissions": [
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -48,7 +52,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["models/*", "images/*"],
+      "resources": ["models/*", "models/onnx/*", "models/onnx/ort/*", "src/ort.wasm.min.js", "images/*"],
       "matches": ["<all_urls>"]
     }
   ],

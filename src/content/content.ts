@@ -2,152 +2,153 @@ import { createStore } from 'redux'
 
 import { createChromeStore } from '../popup/redux/chrome-storage'
 import { rootReducer } from '../popup/redux/reducers'
-import { SettingsState } from '../popup/redux/reducers/settings'
 import { isHostAllowed } from '../utils/allowlist'
-import { CONTEXT_TARGET, UNHIDE_IMAGE, UnhideImageMessage } from '../utils/messages'
+import {
+  CONTEXT_TARGET,
+  REVEAL_PAGE_SENSITIVE,
+  RevealPageSensitiveMessage,
+  RevealPageSensitiveResponse,
+  UNHIDE_IMAGE,
+  UnhideImageMessage
+} from '../utils/messages'
 
 import { DOMWatcher } from './DOMWatcher/DOMWatcher'
-import { BackgroundImageFilter } from './Filter/BackgroundImageFilter'
+import { BackgroundFilter } from './Filter/BackgroundFilter'
 import { ImageFilter } from './Filter/ImageFilter'
+import { PageTally } from './Filter/pageSensitivity'
 import { VideoFilter } from './Filter/VideoFilter'
 
-// chrome.storage reads are async, so there is a gap between document_start (when
-// this script runs) and the store resolving and the observer attaching. Images
-// parsed during that gap would flash before the filter can hide them. To prevent
-// that, inject a stylesheet at document_start that hides every image the filter
-// hasn't tagged yet. Once ImageFilter sets data-nsfw-filter-status, the per-image
-// inline styles take over, so blur and grayscale modes are unaffected.
-const HIDE_STYLE_ID = 'nsfw-filter-pending-hide'
-// Backstop: if the store somehow never settles, reveal images rather than
-// leaving the page permanently blank (matches the "show images if we can't
-// filter" degradation of the .catch branch below).
-const HIDE_STYLE_SAFETY_TIMEOUT = 4000
+/**
+ * Smallest box, on either axis, that is treated as a picture rather than an
+ * icon or a sprite. Matches ImageFilter's floor for <img>.
+ */
+const MIN_BACKGROUND_SIZE = 41
 
-const injectPendingHide = (): void => {
-  const style = document.createElement('style')
-  style.id = HIDE_STYLE_ID
-  style.textContent =
-    'img:not([data-nsfw-filter-status]),video:not([data-nsfw-filter-status]){visibility:hidden !important}'
-  document.documentElement.appendChild(style)
-}
-
-const removePendingHide = (): void => {
-  document.getElementById(HIDE_STYLE_ID)?.remove()
-}
+/** Any element carrying a background verdict, whichever of its three targets holds it. */
+const FILTERED_BACKGROUND = [
+  '[data-nsfw-filter-bg-status="nsfw"]',
+  '[data-nsfw-filter-bg-before-status="nsfw"]',
+  '[data-nsfw-filter-bg-after-status="nsfw"]'
+].join(',')
 
 // Wire the right-click "unhide" menu. On every context-menu open we tell the
-// service worker whether the cursor is over an image we filtered, so it can show
-// the menu item only then; if the user picks it, the worker messages this frame
-// to reveal the element we last reported.
-const wireContextMenuUnhide = (imageFilter: ImageFilter, videoFilter: VideoFilter): void => {
-  let lastTarget: HTMLImageElement | HTMLVideoElement | null = null
+// service worker whether the cursor is over an image we filtered.
+const wireContextMenuUnhide = (imageFilter: ImageFilter, backgroundFilter: BackgroundFilter): void => {
+  let lastImage: HTMLImageElement | null = null
+  let lastBackground: HTMLElement | null = null
 
   document.addEventListener('contextmenu', event => {
-    const target = event.target
-    const media = target instanceof HTMLImageElement || target instanceof HTMLVideoElement
-    const filtered = media && target.dataset.nsfwFilterStatus === 'nsfw'
-    lastTarget = filtered ? target : null
-    chrome.runtime.sendMessage({ type: CONTEXT_TARGET, filtered }).catch(() => undefined)
+    // event.target is retargeted to the shadow host when the cursor is over
+    // something inside an open shadow tree; the path still starts at the real node.
+    const target = event.composedPath()[0] ?? event.target
+    lastImage = null
+    lastBackground = null
+
+    if (target instanceof HTMLImageElement && target.dataset.nsfwFilterStatus === 'nsfw') {
+      lastImage = target
+    } else if (target instanceof Element) {
+      // The cursor lands on whatever sits over the background -- a caption, a
+      // button, the overlay itself -- so the element holding the verdict is
+      // the nearest ancestor carrying one.
+      lastBackground = target.closest<HTMLElement>(FILTERED_BACKGROUND)
+    }
+
+    const filtered = lastImage !== null || lastBackground !== null
+    chrome.runtime.sendMessage({ type: CONTEXT_TARGET, filtered }, () => {
+      if (chrome.runtime.lastError !== undefined) { /* handled */ }
+    })
   }, true)
 
   chrome.runtime.onMessage.addListener((message: UnhideImageMessage) => {
     if (message?.type !== UNHIDE_IMAGE) return
-    if (lastTarget === null) return
 
-    if (lastTarget instanceof HTMLVideoElement) videoFilter.revealVideo(lastTarget)
-    else imageFilter.revealImage(lastTarget)
-    lastTarget = null
+    if (lastImage !== null) imageFilter.revealImage(lastImage)
+    if (lastBackground !== null) backgroundFilter.revealElement(lastBackground)
+
+    lastImage = null
+    lastBackground = null
+  })
+}
+
+// The popup cannot reach the page's DOM, so the reveal arrives as a message
+// aimed at the active tab.
+const wireRevealSwept = (imageFilter: ImageFilter, backgroundFilter: BackgroundFilter): void => {
+  chrome.runtime.onMessage.addListener((
+    message: RevealPageSensitiveMessage,
+    sender,
+    sendResponse: (response: RevealPageSensitiveResponse) => void
+  ) => {
+    if (message?.type !== REVEAL_PAGE_SENSITIVE) return
+    sendResponse({
+      revealed: imageFilter.revealSweptImages() + backgroundFilter.revealSweptBackgrounds()
+    })
   })
 }
 
 const init = (): void => {
-  const imageFilter = new ImageFilter()
-  const videoFilter = new VideoFilter()
+  // One tally per page view, shared so blocked video counts toward the same
+  // threshold blocked images do.
+  const tally = new PageTally()
+  const imageFilter = new ImageFilter(tally)
+  const backgroundFilter = new BackgroundFilter(tally)
 
-  // The unhide menu must work per-frame: contextmenu events don't cross the
-  // iframe boundary, and the background targets the UNHIDE reply to the exact
-  // frame that reported the image. So wire reporting/unhide in every frame, but
-  // keep the actual filtering (DOMWatcher, pending-hide, store) top-frame only.
-  // Without this, the menu's global visibility goes stale over iframe images.
-  wireContextMenuUnhide(imageFilter, videoFilter)
+  // Unhide menu must work per-frame (contextmenu does not cross iframes).
+  wireContextMenuUnhide(imageFilter, backgroundFilter)
 
-  // Ignore iframes for filtering, https://stackoverflow.com/a/326076/10432429
+  // Filtering stays top-frame only.
   if (window.self !== window.top) return
 
-  const backgroundFilter = new BackgroundImageFilter()
-  const domWatcher = new DOMWatcher(imageFilter, videoFilter, backgroundFilter)
+  // Top frame only, like the sweep it undoes.
+  wireRevealSwept(imageFilter, backgroundFilter)
 
-  injectPendingHide()
-  const safety = setTimeout(removePendingHide, HIDE_STYLE_SAFETY_TIMEOUT)
-
-  // Whether this page should be filtered right now, from a settings snapshot.
-  const shouldFilter = (settings: SettingsState): boolean =>
-    settings.enabled && !isHostAllowed(window.location.hostname, settings.websites)
+  const videoFilter = new VideoFilter(tally)
+  // A video that can't be classified may take its verdict from a cover image
+  // judged after it.
+  imageFilter.onFlagged(() => videoFilter.recheckCovers())
 
   createChromeStore({ createStore })(rootReducer)
     .then(store => {
-      clearTimeout(safety)
+      const settings = store.getState().settings
+      const {
+        enabled,
+        filterEffect,
+        websites,
+        interImageAwarenessEnabled,
+        interImageAwarenessMinCount,
+        interImageAwarenessMinRatio,
+        backgroundScanMode
+      } = settings
 
-      let previous = store.getState().settings
-      imageFilter.setSettings({ filterEffect: previous.filterEffect })
-      videoFilter.setSettings({ filterEffect: previous.filterEffect })
-
-      let filtering = shouldFilter(previous)
-      if (filtering) {
-        // Keep the pending-hide stylesheet in place: from here per-image tagging
-        // governs visibility (and it also hides dynamically-added images before
-        // the observer's callback can run hideImage).
-        domWatcher.watch()
-      } else {
-        // Extension turned off, or filtering disabled for this site: reveal everything.
-        backgroundFilter.stop()
-        removePendingHide()
-      }
-
-      // reduxed keeps this store synced with chrome.storage, so a popup toggle or
-      // an allowlist edit lands here without a reload. React live: start/stop
-      // watching when on/off or the allowlist flips, and re-render already-blocked
-      // images when the effect changes (a new effect isn't a new verdict).
-      store.subscribe(() => {
-        const next = store.getState().settings
-        const prev = previous
-        previous = next
-
-        if (next.filterEffect !== prev.filterEffect) {
-          imageFilter.setSettings({ filterEffect: next.filterEffect })
-          videoFilter.setSettings({ filterEffect: next.filterEffect })
-          if (filtering) {
-            imageFilter.applyEffectToBlocked()
-            videoFilter.applyEffectToBlocked()
-          }
-        }
-
-        const nextFiltering = shouldFilter(next)
-        if (nextFiltering === filtering) return
-        filtering = nextFiltering
-
-        if (filtering) {
-          videoFilter.start()
-          backgroundFilter.start()
-          domWatcher.watch()
-        } else {
-          domWatcher.unwatch()
-          backgroundFilter.stop()
-          removePendingHide()
-          imageFilter.revealAll()
-          videoFilter.revealAll()
-          videoFilter.stop()
-          backgroundFilter.revealAll()
-        }
+      imageFilter.setSettings({
+        filterEffect,
+        interImageAwareness: interImageAwarenessEnabled === true
+          ? { minCount: interImageAwarenessMinCount, minRatio: interImageAwarenessMinRatio }
+          : undefined
       })
+      videoFilter.setSettings({ filterEffect })
+      backgroundFilter.setSettings({
+        filterEffect,
+        interImageAwareness: interImageAwarenessEnabled === true
+          ? { minCount: interImageAwarenessMinCount, minRatio: interImageAwarenessMinRatio }
+          : undefined
+      })
+
+      const domWatcher = new DOMWatcher(imageFilter, videoFilter, {
+        filter: backgroundFilter,
+        mode: backgroundScanMode,
+        minSize: MIN_BACKGROUND_SIZE
+      })
+
+      const allowed = isHostAllowed(window.location.hostname, websites)
+      if (enabled && !allowed) {
+        domWatcher.watch()
+      }
     })
     .catch(error => {
       console.warn(error)
       imageFilter.setSettings({ filterEffect: 'blur' })
       videoFilter.setSettings({ filterEffect: 'blur' })
-      backgroundFilter.stop()
-      clearTimeout(safety)
-      removePendingHide()
+      backgroundFilter.setSettings({ filterEffect: 'blur' })
     })
 }
 

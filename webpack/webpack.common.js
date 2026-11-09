@@ -3,14 +3,15 @@ const CopyPlugin = require('copy-webpack-plugin')
 
 const PATHS = {
     src: path.join(__dirname, '../src'),
-    dist: path.join(__dirname, '../dist/src')
+    dist: path.join(__dirname, '../dist/src'),
+    distRoot: path.join(__dirname, '../dist')
 }
 
 module.exports = {
     entry: {
         content: `${PATHS.src}/content/content.ts`,
         background: `${PATHS.src}/background/background.ts`,
-        offscreen: `${PATHS.src}/offscreen/offscreen.ts`,
+        offscreen: `${PATHS.src}/background/offscreen.ts`,
         popup: `${PATHS.src}/popup/index.tsx`,
         options: `${PATHS.src}/options/index.tsx`,
     },
@@ -47,12 +48,41 @@ module.exports = {
             patterns: [
                 { from: `${PATHS.src}/popup/popup.html`, to: PATHS.dist },
                 { from: `${PATHS.src}/options/options.html`, to: PATHS.dist },
-                { from: `${PATHS.src}/offscreen/offscreen.html`, to: PATHS.dist },
+                { from: `${PATHS.src}/background/offscreen.html`, to: PATHS.dist },
                 // TensorFlow.js WASM backend binaries, loaded via setWasmPaths()
                 {
                     from: '*.wasm',
                     context: path.join(__dirname, '../node_modules/@tensorflow/tfjs-backend-wasm/dist'),
+                    to: path.join(PATHS.distRoot, 'models')
+                },
+                // ORT Web runs from a classic <script> in offscreen.html, outside
+                // the bundle. Its WASM loader needs both the .wasm and the .mjs
+                // glue under wasmPaths; numThreads=1 at runtime avoids spawning
+                // workers, which need SharedArrayBuffer.
+                {
+                    from: 'ort.wasm.min.js',
+                    context: path.join(__dirname, '../node_modules/onnxruntime-web/dist'),
                     to: PATHS.dist
+                },
+                {
+                    from: 'ort-wasm-simd-threaded.wasm',
+                    context: path.join(__dirname, '../node_modules/onnxruntime-web/dist'),
+                    to: path.join(PATHS.distRoot, 'models/onnx/ort')
+                },
+                {
+                    from: 'ort-wasm-simd-threaded.mjs',
+                    context: path.join(__dirname, '../node_modules/onnxruntime-web/dist'),
+                    to: path.join(PATHS.distRoot, 'models/onnx/ort')
+                },
+                {
+                    from: 'ort-wasm-simd-threaded.jsep.wasm',
+                    context: path.join(__dirname, '../node_modules/onnxruntime-web/dist'),
+                    to: path.join(PATHS.distRoot, 'models/onnx/ort')
+                },
+                {
+                    from: 'ort-wasm-simd-threaded.jsep.mjs',
+                    context: path.join(__dirname, '../node_modules/onnxruntime-web/dist'),
+                    to: path.join(PATHS.distRoot, 'models/onnx/ort')
                 },
             ],
         }),

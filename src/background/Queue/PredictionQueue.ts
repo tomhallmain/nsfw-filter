@@ -1,39 +1,34 @@
 import { setTotalBlocked } from '../../popup/redux/actions/statistics'
 import { ILogger } from '../../utils/Logger'
-import { IReduxedStorage } from '../background'
-import { OffscreenModel } from '../OffscreenModel'
+import { ClassificationResult } from '../classifier/ClassificationResult'
+import { IUrlClassifier } from '../classifier/MediaClassifier'
+import { IReduxedStorage } from '../types'
 
 import { ConcurrentQueue } from './ConcurrentQueue'
 import { QueueBase, requestQueueValue, TabIdUrl } from './QueueBase'
 
 type HandlerParams = {
   url: string
-  source?: string
   tabIdUrl: TabIdUrl
-  result: boolean
+  result: ClassificationResult
   error: Error
 }
 
-type OnProcessParam = Pick<HandlerParams, 'url' | 'tabIdUrl' | 'source'>
-export type OnSuccessParam = Pick<HandlerParams, 'url' | 'result' | 'source'>
+type OnProcessParam = Pick<HandlerParams, 'url' | 'tabIdUrl'>
+export type OnSuccessParam = Pick<HandlerParams, 'url' | 'result'>
 export type OnFailureParam = Pick<HandlerParams, 'url' | 'error'>
 type OnDoneParam = Pick<HandlerParams, 'url'>
 
 export type CallbackFunction = (err: unknown | undefined, result: unknown | undefined) => undefined
 
-// Manifest V2 split this into a LoadingQueue (download the image into an <img>)
-// and a PredictionQueue (run the model). Under Manifest V3 both happen inside the
-// offscreen document, so one queue forwards each URL to the offscreen model.
-// Image loading still runs in parallel (high concurrency here) while the offscreen
-// document serialises the predictions, matching the original behaviour.
 export class PredictionQueue extends QueueBase {
   protected readonly predictionQueue: ConcurrentQueue<OnProcessParam>
 
-  constructor (model: OffscreenModel, logger: ILogger, store: IReduxedStorage) {
+  constructor (model: IUrlClassifier, logger: ILogger, store: IReduxedStorage) {
     super(model, logger, store)
 
     this.predictionQueue = new ConcurrentQueue({
-      concurrency: 100, // IO-bound image loads run in parallel in the offscreen doc
+      concurrency: 1,
       timeout: 0,
       onProcess: this.onProcess.bind(this),
       onSuccess: this.onSuccess.bind(this),
@@ -43,25 +38,22 @@ export class PredictionQueue extends QueueBase {
     })
   }
 
-  private onProcess ({ url, source, tabIdUrl }: OnProcessParam, callback: CallbackFunction): void {
+  private onProcess ({ url, tabIdUrl }: OnProcessParam, callback: CallbackFunction): void {
     if (!this._checkCurrentTabIdUrlStatus(tabIdUrl)) {
       callback({ url, error: new Error('User closed tab or page where this url located') }, undefined)
       return
     }
 
-    this.model.predict(source ?? url, url)
-      .then(result => callback(undefined, { url, source, result }))
+    this.model.predict(url, 'image')
+      .then(result => callback(undefined, { url, result }))
       .catch((error: Error) => callback({ url, error }, undefined))
   }
 
-  private onSuccess ({ url, source, result }: OnSuccessParam): void {
+  private onSuccess ({ url, result }: OnSuccessParam): void {
     if (!this._checkUrlStatus(url)) return
 
-    if (result) this.totalBlocked++
-    // A request carrying its own source is a video frame under a one-off key.
-    // Caching a verdict under a key nothing will ask for again only evicts
-    // entries that are still worth keeping.
-    if (source === undefined) this.cache.set(url, result)
+    if (result.blocked) this.totalBlocked++
+    this.cache.set(url, result)
 
     for (const [{ resolve }] of this.requestMap.get(url) as requestQueueValue) {
       resolve(result)
@@ -71,10 +63,10 @@ export class PredictionQueue extends QueueBase {
   private onFailure ({ url, error }: OnFailureParam): void {
     if (!this._checkUrlStatus(url)) return
 
-    // Not cached. A failure means no verdict, usually an unavailable model rather
-    // than a safe image, so caching `false` would keep serving "safe" for that URL
-    // until the entry is evicted.
-
+    // Failures stay out of the cache, unlike results: a timeout or an
+    // unreachable offscreen document says nothing about the media, and
+    // caching it would leave the url unfiltered for the rest of this
+    // worker's life.
     for (const [{ reject }] of this.requestMap.get(url) as requestQueueValue) {
       reject(error)
     }
@@ -85,7 +77,6 @@ export class PredictionQueue extends QueueBase {
   }
 
   private onDrain (): void {
-    // @DOCS Async operations
     const tmpTotalBlocked = this.totalBlocked
     this.store.dispatch(setTotalBlocked(tmpTotalBlocked))
   }

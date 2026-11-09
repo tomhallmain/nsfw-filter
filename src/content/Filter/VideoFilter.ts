@@ -1,505 +1,408 @@
-import { PredictionRequest } from '../../utils/messages'
+import { PredictionRequest, PredictionResponse } from '../../utils/messages'
+import { queryAllDeep } from '../shadowRoots'
 
-import { Filter } from './Filter'
+import { applyDirectClassBorder, clearDirectClassBorder } from './borderFrame'
+import { blurFilterForScore } from './blurEffect'
+import { Filter, isCrossContextBlobUrl } from './Filter'
+import { MediaFilterSettingsType } from './ImageFilter'
+import { PageTally } from './pageSensitivity'
+
+/**
+ * An HLS or DASH manifest is a text playlist, not media: the classifier can't
+ * decode it, and the player turns it into a blob: source anyway.
+ */
+const STREAM_MANIFEST_PATH = /\.(m3u8|mpd)$/i
+const STREAM_MANIFEST_TYPE = /mpegurl|dash\+xml/i
+
+const isStreamManifest = (video: HTMLVideoElement, url: string): boolean => {
+  try {
+    if (STREAM_MANIFEST_PATH.test(new URL(url, document.baseURI).pathname)) return true
+  } catch {
+    return false
+  }
+
+  const sources = video.getElementsByTagName('source')
+  for (let i = 0; i < sources.length; i++) {
+    if (sources[i].src === url && STREAM_MANIFEST_TYPE.test(sources[i].type)) return true
+  }
+  return false
+}
+
+/** Sources no request can ever classify; they are never sent to the background. */
+const isUnclassifiableSource = (video: HTMLVideoElement, url: string): boolean =>
+  isCrossContextBlobUrl(url) || isStreamManifest(video, url)
+
+/**
+ * A flagged image counts as a video's cover when it covers at least this share
+ * of the video's box.
+ */
+const COVER_MIN_OVERLAP = 0.8
+
+/**
+ * How far above the video the search for a cover image starts. It only bounds
+ * the search; overlap decides what counts as a cover.
+ */
+const COVER_SEARCH_DEPTH = 6
+
+const FLAGGED_IMAGE = 'img[data-nsfw-filter-status="nsfw"]'
+
+/** Share of `target`'s area that `cover` overlaps, 0 when `target` has no box. */
+const overlapShare = (target: DOMRect, cover: DOMRect): number => {
+  const area = target.width * target.height
+  if (area <= 0) return 0
+
+  const width = Math.min(target.right, cover.right) - Math.max(target.left, cover.left)
+  const height = Math.min(target.bottom, cover.bottom) - Math.max(target.top, cover.top)
+  return width > 0 && height > 0 ? (width * height) / area : 0
+}
+
+type NsfwTreatment = {
+  topNsfwClass?: string
+  borderColor?: string
+  score?: number
+}
 
 export type IVideoFilter = {
-  analyzeVideo: (video: HTMLVideoElement, sourceChanged: boolean) => void
-  checkPoster: (video: HTMLVideoElement) => void
-  revealVideo: (video: HTMLVideoElement) => void
-  checkStyleMutation: (video: HTMLVideoElement) => void
-  applyEffectToBlocked: () => void
-  revealAll: () => void
-  start: () => void
-  stop: () => void
+  analyzeVideo: (video: HTMLVideoElement, srcAttribute: boolean) => void
+  setSettings: (settings: MediaFilterSettingsType) => void
 }
-
-type VideoState = {
-  // Bumped whenever the element starts playing different media. A reply carrying
-  // an older generation is for footage this element is no longer showing.
-  generation: number
-  // Poster requests carry their own counter: a poster swap replaces the preview
-  // without replacing the footage, so it must not invalidate frame work.
-  posterGeneration: number
-  approved: number
-  lastSampleTime: number
-  unsampleable: boolean
-  // A verdict is out for footage that has decoded, so the element is hidden for
-  // the frame, not for the poster: nothing about the poster may reveal it.
-  framePending: boolean
-  // The user unhid this element. Verdicts still in flight no longer apply.
-  overridden: boolean
-  observed: boolean
-  wired: boolean
-}
-
-const FRAME_SIZE = 224
-const FRAME_QUALITY = 0.8
-const MIN_VIDEO_SIZE = 41
-// Sampling follows media time, not wall time: a paused or buffering video is not
-// showing anything new, and a 2x playback is showing it twice as fast.
-const SAMPLE_INTERVAL = 10
-// A video can be laid out long before it has a frame to give (preload="none",
-// a slow network). Reveal it rather than hold a hidden element on a frame that
-// may never decode.
-const FRAME_DEADLINE = 3000
-const OFFSCREEN_MARGIN = '300px'
-
-// Frames are keyed, not addressed, and the background deduplicates by key across
-// every tab. A counter alone would hand tab B the verdict for tab A's frame, so
-// the key is scoped to this realm.
-const REALM = crypto.getRandomValues(new Uint32Array(2)).join('')
-let frameRequests = 0
-const frameKey = (): string => `nsfw-filter-frame:${REALM}-${++frameRequests}`
 
 export class VideoFilter extends Filter implements IVideoFilter {
-  private readonly states: WeakMap<HTMLVideoElement, VideoState>
-  private readonly due: Set<HTMLVideoElement>
-  private readonly visible: Set<HTMLVideoElement>
-  private readonly viewport: IntersectionObserver
-  private sampling: boolean
-  private active: boolean
+  private settings: MediaFilterSettingsType
+  private readonly MIN_VIDEO_SIZE: number
+  private readonly DYNAMIC_ANALYSIS_DISABLED_HOSTS: RegExp[]
 
-  constructor () {
-    super()
-    this.states = new WeakMap()
-    this.due = new Set()
-    this.visible = new Set()
-    this.sampling = false
-    this.active = true
-    this.viewport = new IntersectionObserver(
-      entries => this.onIntersection(entries),
-      { rootMargin: OFFSCREEN_MARGIN }
-    )
-    // A background tab is not sampled, and a paused video in one produces no
-    // media events on the way back. Nothing else would ask again.
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState !== 'visible') return
-      for (const video of this.visible) this.schedule(video)
-    })
+  constructor (tally?: PageTally) {
+    super(tally)
+    this.settings = { filterEffect: 'hide' }
+    this.MIN_VIDEO_SIZE = 41
+    this.DYNAMIC_ANALYSIS_DISABLED_HOSTS = [
+      /(^|\.)youtube\.com$/i,
+      /(^|\.)youtu\.be$/i,
+      /(^|\.)netflix\.com$/i,
+      /(^|\.)hulu\.com$/i,
+      /(^|\.)disneyplus\.com$/i,
+      /(^|\.)primevideo\.com$/i,
+      /(^|\.)twitch\.tv$/i,
+      /(^|\.)vimeo\.com$/i
+    ]
   }
 
-  public analyzeVideo (video: HTMLVideoElement, sourceChanged: boolean = false): void {
-    if (!this.active) {
-      // Filtering was turned off while this video was out of the document, so
-      // revealAll() never reached it. It comes back filtered otherwise.
-      if (video.dataset.nsfwFilterStatus !== undefined) this.retire(video)
+  public setSettings (settings: MediaFilterSettingsType): void {
+    this.settings = settings
+  }
+
+  public analyzeVideo (video: HTMLVideoElement, _srcAttribute: boolean = false): void {
+    if (this.isDynamicAnalysisDisabledForCurrentHost()) {
+      video.dataset.nsfwFilterStatus = 'sfw'
+      this.clearPending(video)
+      clearDirectClassBorder(video)
+      video.style.filter = 'none'
+      video.style.visibility = 'visible'
       return
     }
 
-    const state = this.stateOf(video)
-    if (sourceChanged) this.reset(video, state)
-    if (!state.wired) this.wire(video, state)
-    // A video the page took out and put back is no longer observed: unobserving
-    // ends observation for good, while the listeners survive the round trip.
-    if (!state.observed) {
-      state.observed = true
-      this.viewport.observe(video)
-    }
-
-    if (video.dataset.nsfwFilterStatus === undefined) {
-      // Small videos are no more filtered than small images, but they still need
-      // a status so the pending-hide stylesheet stops hiding them.
-      if (this.tooSmall(video)) {
-        video.dataset.nsfwFilterStatus = 'sfw'
-        return
-      }
-
-      if (video.poster.length > 0) {
-        video.dataset.nsfwFilterStatus = 'processing'
-        this.hideElement(video)
-        this.classifyPoster(video, state)
-      } else {
-        // Nothing on screen to judge yet. The frame that appears is judged below,
-        // and until then the element has to carry a status or the pending-hide
-        // stylesheet keeps hiding it.
-        video.dataset.nsfwFilterStatus = 'sfw'
-      }
-    }
-
-    // A paused video still shows its first decoded frame, so having one is reason
-    // enough to sample.
-    if (!video.paused || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) this.schedule(video)
-  }
-
-  // A poster swap replaces the preview, not the footage: a frame verdict already
-  // reached for this media outranks whatever the new poster says.
-  public checkPoster (video: HTMLVideoElement): void {
-    if (!this.active) return
-
-    const state = this.stateOf(video)
-    if (video.poster.length === 0) {
-      // The preview is gone, and with it the reason this element is hidden. The
-      // reply for it is dropped, so nothing else would settle the hide.
-      state.posterGeneration++
-      if (video.dataset.nsfwFilterStatus === 'processing' && !state.framePending) {
-        this.reveal(video)
-        this.schedule(video)
-      }
-      return
-    }
-    if (video.dataset.nsfwFilterStatus === 'nsfw') return
-    // Until the video has played, the poster is what is on screen, however many
-    // frames have been decoded and judged behind it.
-    if (state.approved === state.generation && video.played.length > 0) return
-
-    state.posterGeneration++
-    video.dataset.nsfwFilterStatus = 'processing'
-    this.hideElement(video)
-    this.classifyPoster(video, state)
-  }
-
-  // User-initiated unhide from the right-click menu. Sampling stops until the
-  // element plays different media: re-blocking what the user just revealed would
-  // make the menu item useless.
-  public revealVideo (video: HTMLVideoElement): void {
-    const state = this.stateOf(video)
-    state.approved = state.generation
-    state.unsampleable = true
-    state.overridden = true
-    this.due.delete(video)
-
-    this.revealElement(video)
-    video.dataset.nsfwFilterStatus = 'sfw'
-  }
-
-  public checkStyleMutation (video: HTMLVideoElement): void {
+    const mediaUrl = this.getVideoSource(video)
     const status = video.dataset.nsfwFilterStatus
-    if (status === 'processing') {
-      if (video.style.visibility !== 'hidden') this.hideElement(video)
-      return
-    }
-    if (status !== 'nsfw') return
-    if (this.isEffectApplied(video)) return
-    this.applyEffect(video)
-  }
+    if (
+      (mediaUrl !== video.dataset.nsfwFilterSrc || status === undefined || status === 'error') &&
+      this.isValidForChecking(video)
+    ) {
+      if (mediaUrl.length === 0) return
 
-  public applyEffectToBlocked (): void {
-    const blocked = document.querySelectorAll<HTMLVideoElement>('video[data-nsfw-filter-status="nsfw"]')
-    blocked.forEach(video => this.applyEffect(video))
-  }
+      if (status === 'nsfw') this.clearAppliedEffect(video)
 
-  public revealAll (): void {
-    const filtered = document.querySelectorAll<HTMLVideoElement>('video[data-nsfw-filter-status]')
-    filtered.forEach(video => this.retire(video))
-  }
-
-  // A verdict reached while filtering was on does not survive being turned off
-  // and on again, the same way images are reclassified rather than trusted. The
-  // user's unhide goes with it, or the next verdict is dropped and the video
-  // stays hidden.
-  private retire (video: HTMLVideoElement): void {
-    this.revealElement(video)
-    delete video.dataset.nsfwFilterStatus
-    this.due.delete(video)
-
-    const state = this.stateOf(video)
-    state.generation++
-    state.unsampleable = false
-    state.framePending = false
-    state.overridden = false
-  }
-
-  // Filtering was turned off for this page. The elements stay wired, so turning
-  // it back on picks up the videos already on the page.
-  public stop (): void {
-    this.active = false
-    this.due.clear()
-  }
-
-  public start (): void {
-    this.active = true
-  }
-
-  private stateOf (video: HTMLVideoElement): VideoState {
-    const existing = this.states.get(video)
-    if (existing !== undefined) return existing
-
-    const state: VideoState = {
-      generation: 0,
-      posterGeneration: 0,
-      approved: -1,
-      lastSampleTime: Number.NEGATIVE_INFINITY,
-      unsampleable: false,
-      framePending: false,
-      overridden: false,
-      observed: false,
-      wired: false
-    }
-    this.states.set(video, state)
-
-    return state
-  }
-
-  private reset (video: HTMLVideoElement, state: VideoState): void {
-    state.generation++
-    state.posterGeneration++
-    state.approved = -1
-    state.lastSampleTime = Number.NEGATIVE_INFINITY
-    state.unsampleable = false
-    state.framePending = false
-    state.overridden = false
-    this.due.delete(video)
-    delete video.dataset.nsfwFilterStatus
-    // Nothing is being shown yet, and the effect belonged to the old media. The
-    // next sample hides it again if there is anything to judge.
-    this.revealElement(video)
-  }
-
-  private wire (video: HTMLVideoElement, state: VideoState): void {
-    state.wired = true
-
-    // Different media in the same element: everything decided about the old
-    // source, including a user unhide, stops applying. The element is then judged
-    // from scratch, which also gives it back the status the pending-hide
-    // stylesheet needs to stop hiding it.
-    const restart = (): void => {
-      this.reset(video, state)
-      this.analyzeVideo(video, false)
-    }
-    video.addEventListener('loadstart', restart)
-    video.addEventListener('emptied', restart)
-
-    video.addEventListener('play', () => {
-      // A page that calls play() on a blocked video gets it back paused rather
-      // than playing behind the effect.
-      if (video.dataset.nsfwFilterStatus === 'nsfw') {
-        video.pause()
+      if (isUnclassifiableSource(video, mediaUrl)) {
+        this.markUnsupported(video)
         return
       }
-      this.schedule(video)
-    })
-    // The first decoded frame is on screen whether or not anything is playing.
-    video.addEventListener('loadeddata', () => this.schedule(video))
-    // Seeking exposes a frame nothing has judged, including while paused.
-    video.addEventListener('seeked', () => this.schedule(video))
-    video.addEventListener('timeupdate', () => this.schedule(video))
-  }
 
-  private onIntersection (entries: IntersectionObserverEntry[]): void {
-    for (const entry of entries) {
-      const video = entry.target as HTMLVideoElement
-      if (entry.isIntersecting) {
-        this.visible.add(video)
-        this.schedule(video)
-        continue
-      }
-
-      this.visible.delete(video)
-      // Removal from the document reads as leaving the viewport, which is the
-      // one signal that a feed dropping videos gives us.
-      if (!video.isConnected) {
-        this.stateOf(video).observed = false
-        this.viewport.unobserve(video)
-        this.due.delete(video)
-      }
+      video.dataset.nsfwFilterSrc = mediaUrl
+      video.dataset.nsfwFilterStatus = 'processing'
+      this.showPending(video)
+      this.analyze(video, mediaUrl)
     }
   }
 
-  private tooSmall (video: HTMLVideoElement): boolean {
-    const width = video.clientWidth
-    const height = video.clientHeight
+  private analyze (video: HTMLVideoElement, mediaUrl: string): void {
+    const request = new PredictionRequest(mediaUrl, 'video')
 
-    return width !== 0 && height !== 0 && (width <= MIN_VIDEO_SIZE || height <= MIN_VIDEO_SIZE)
+    this.requestToAnalyzeImage(request)
+      .then(response => {
+        const { result, url, borderColor, topNsfwClass, score } = response
+        if (this.getVideoSource(video) !== url) {
+          this.clearPending(video)
+          return
+        }
+
+        if (response.failed) {
+          this.markUnclassified(video)
+          return
+        }
+
+        if (result) {
+          this.recordVerdict(true)
+          this.applyNsfw(video, { topNsfwClass, borderColor, score })
+          if (this.settings.filterEffect === 'hide') return
+        } else {
+          this.recordVerdict(false)
+          video.dataset.nsfwFilterStatus = 'sfw'
+          delete video.dataset.nsfwFilterClass
+          clearDirectClassBorder(video)
+        }
+
+        this.showVideo(video)
+      })
+      .catch(() => {
+        this.markUnclassified(video)
+      })
   }
 
-  private schedule (video: HTMLVideoElement): void {
-    const state = this.stateOf(video)
-    if (!this.eligible(video, state)) return
+  private applyNsfw (video: HTMLVideoElement, { topNsfwClass, borderColor, score }: NsfwTreatment): void {
+    video.dataset.nsfwFilterStatus = 'nsfw'
+    if (topNsfwClass !== undefined) video.dataset.nsfwFilterClass = topNsfwClass
+    this.muteVideoAudio(video)
 
-    this.due.add(video)
-    void this.drain()
-  }
-
-  private eligible (video: HTMLVideoElement, state: VideoState): boolean {
-    if (!this.active || state.unsampleable || state.overridden) return false
-    if (video.dataset.nsfwFilterStatus === 'nsfw') return false
-    if (!this.visible.has(video) || document.visibilityState !== 'visible') return false
-    if (this.tooSmall(video)) return false
-    // Once a frame of this media has been cleared, resample only as the footage
-    // moves on. Everything that can happen to a video on a busy page routes
-    // through here, so the interval is enforced here rather than per event.
-    if (state.approved === state.generation) {
-      const elapsed = video.currentTime - state.lastSampleTime
-      if (elapsed >= 0 && elapsed < SAMPLE_INTERVAL) return false
+    if (this.settings.filterEffect === 'hide') {
+      video.pause()
+      video.style.visibility = 'hidden'
+      this.clearPending(video)
+      return
     }
 
+    // No DOM wrapper for videos (breaks players). Outline is applied
+    // directly; category tint stays image-only for the same reason.
+    if (this.settings.filterEffect === 'blur') {
+      video.style.filter = blurFilterForScore(score)
+    } else {
+      video.style.filter = 'grayscale(1)'
+    }
+    applyDirectClassBorder(video, borderColor)
+  }
+
+  /**
+   * Re-check every video that can't be classified against the flagged images
+   * around it. Called when an image comes back NSFW, since a cover can be
+   * judged after the video beneath it was given up on.
+   */
+  public recheckCovers (): void {
+    queryAllDeep<HTMLVideoElement>('video[data-nsfw-filter-status="error"]')
+      .forEach(video => this.inheritCoverVerdict(video))
+  }
+
+  /**
+   * A video that can't be classified takes on its cover's NSFW verdict: the
+   * `poster`, or a flagged image covering most of the video's box. A cover
+   * shows one moment of the video, so only a positive verdict carries over; a
+   * clean cover says nothing about the rest. An inherited verdict is marked
+   * with a `cover` basis and is not counted toward page sensitivity, because
+   * the cover already counted.
+   */
+  private inheritCoverVerdict (video: HTMLVideoElement): void {
+    if (!this.awaitsCoverVerdict(video)) return
+
+    if (this.findFlaggedCover(video) !== null) {
+      this.applyCoverVerdict(video, {})
+      return
+    }
+
+    const poster = video.poster
+    if (poster.length === 0 || /^(?:blob|data):/i.test(poster)) return
+
+    const source = video.dataset.nsfwFilterSrc
+    this.requestToAnalyzeImage(new PredictionRequest(poster, 'image'))
+      .then(response => {
+        if (!this.posterVerdictApplies(video, source, poster, response)) return
+        const { topNsfwClass, borderColor, score } = response
+        this.applyCoverVerdict(video, { topNsfwClass, borderColor, score })
+      })
+      .catch(() => undefined)
+  }
+
+  private awaitsCoverVerdict (video: HTMLVideoElement): boolean {
+    const source = video.dataset.nsfwFilterSrc
+    return video.dataset.nsfwFilterStatus === 'error' &&
+      source !== undefined &&
+      isUnclassifiableSource(video, source)
+  }
+
+  /** The video may have moved on while its poster was being judged. */
+  private posterVerdictApplies (
+    video: HTMLVideoElement,
+    source: string | undefined,
+    poster: string,
+    response: PredictionResponse
+  ): boolean {
+    return response.result &&
+      !response.failed &&
+      video.poster === poster &&
+      video.dataset.nsfwFilterSrc === source &&
+      this.awaitsCoverVerdict(video)
+  }
+
+  private findFlaggedCover (video: HTMLVideoElement): HTMLImageElement | null {
+    const box = video.getBoundingClientRect()
+
+    let scope: Element = video
+    for (let i = 0; i < COVER_SEARCH_DEPTH && scope.parentElement !== null; i++) {
+      scope = scope.parentElement
+    }
+
+    const flagged = scope.querySelectorAll<HTMLImageElement>(FLAGGED_IMAGE)
+    for (let i = 0; i < flagged.length; i++) {
+      if (overlapShare(box, flagged[i].getBoundingClientRect()) >= COVER_MIN_OVERLAP) return flagged[i]
+    }
+    return null
+  }
+
+  private applyCoverVerdict (video: HTMLVideoElement, treatment: NsfwTreatment): void {
+    video.dataset.nsfwFilterBasis = 'cover'
+    this.applyNsfw(video, treatment)
+  }
+
+  /**
+   * A player reusing one <video> across items still carries the previous
+   * source's effect, which no later verdict path removes. Audio is left as is:
+   * unmuting could override a mute the user or the site set.
+   */
+  private clearAppliedEffect (video: HTMLVideoElement): void {
+    video.style.filter = ''
+    clearDirectClassBorder(video)
+    delete video.dataset.nsfwFilterClass
+    delete video.dataset.nsfwFilterBasis
+  }
+
+  /**
+   * No verdict was reached. The video plays, but is recorded as unjudged so it
+   * stays eligible for another attempt -- writing 'sfw' here would be
+   * indistinguishable from a real verdict and would never be revisited.
+   */
+  private markUnclassified (video: HTMLVideoElement): void {
+    video.dataset.nsfwFilterStatus = 'error'
+    delete video.dataset.nsfwFilterClass
+    clearDirectClassBorder(video)
+    this.showVideo(video)
+    this.retryAfterFailure(video, () => this.analyzeVideo(video, false))
+  }
+
+  /**
+   * A source no request can classify (see `isUnclassifiableSource`). Unlike a
+   * transient failure, this never retries: shown unfiltered, unless its cover
+   * is flagged, and left alone until the src genuinely changes.
+   */
+  private markUnsupported (video: HTMLVideoElement): void {
+    video.dataset.nsfwFilterSrc = this.getVideoSource(video)
+    video.dataset.nsfwFilterStatus = 'error'
+    delete video.dataset.nsfwFilterClass
+    delete video.dataset.nsfwFilterBasis
+    clearDirectClassBorder(video)
+    this.showVideo(video)
+    this.inheritCoverVerdict(video)
+  }
+
+  private isValidForChecking (video: HTMLVideoElement): boolean {
+    return (
+      (video.width > this.MIN_VIDEO_SIZE && video.height > this.MIN_VIDEO_SIZE) ||
+      (video.videoWidth > this.MIN_VIDEO_SIZE && video.videoHeight > this.MIN_VIDEO_SIZE) ||
+      video.width === 0 ||
+      video.height === 0
+    )
+  }
+
+  private getVideoSource (video: HTMLVideoElement): string {
+    if (video.currentSrc.length > 0) return video.currentSrc
+    if (video.src.length > 0) return video.src
+
+    const source = video.querySelector('source')
+    return source?.src ?? ''
+  }
+
+  private showVideo (video: HTMLVideoElement): void {
+    this.clearPending(video)
+    video.style.visibility = 'visible'
+  }
+
+  private showPending (video: HTMLVideoElement): void {
+    this.clearPending(video)
+
+    const placeholder = document.createElement('div')
+    placeholder.dataset.nsfwFilterPendingFor = 'video'
+    placeholder.style.display = 'flex'
+    placeholder.style.alignItems = 'center'
+    placeholder.style.justifyContent = 'center'
+    placeholder.style.textAlign = 'center'
+    placeholder.style.fontSize = '12px'
+    placeholder.style.fontFamily = 'Arial, sans-serif'
+    placeholder.style.color = '#dbdbdb'
+    placeholder.style.background = '#1f1f1f'
+    placeholder.style.border = '1px solid #333333'
+    placeholder.style.borderRadius = '4px'
+    placeholder.style.width = `${this.resolveWidth(video)}px`
+    placeholder.style.height = `${this.resolveHeight(video)}px`
+    placeholder.textContent = 'Checking media...'
+
+    // parentNode, not parentElement: a video can sit directly under a shadow root.
+    video.parentNode?.insertBefore(placeholder, video)
+    video.style.visibility = 'hidden'
+    video.dataset.nsfwFilterPendingId = Math.random().toString(36).slice(2)
+    placeholder.dataset.nsfwFilterPendingId = video.dataset.nsfwFilterPendingId
+  }
+
+  private clearPending (video: HTMLVideoElement): void {
+    const placeholderId = video.dataset.nsfwFilterPendingId
+    if (placeholderId === undefined) return
+
+    // Search the whole tree the video is in (the document, or its shadow root),
+    // not its parent: a later wrapper around the video would hide a sibling from
+    // parentElement.querySelector. A detached video leaves its placeholder behind
+    // in the document.
+    const tree = video.isConnected ? video.getRootNode() as Document | ShadowRoot : document
+    tree.querySelector(`[data-nsfw-filter-pending-id="${placeholderId}"]`)?.remove()
+
+    delete video.dataset.nsfwFilterPendingId
+  }
+
+  private resolveWidth (video: HTMLVideoElement): number {
+    const fromRect = Math.floor(video.getBoundingClientRect().width)
+    if (fromRect > 0) return fromRect
+    if (video.clientWidth > 0) return video.clientWidth
+    if (video.width > 0) return video.width
+    return 160
+  }
+
+  private resolveHeight (video: HTMLVideoElement): number {
+    const fromRect = Math.floor(video.getBoundingClientRect().height)
+    if (fromRect > 0) return fromRect
+    if (video.clientHeight > 0) return video.clientHeight
+    if (video.height > 0) return video.height
+    return 90
+  }
+
+  private muteVideoAudio (video: HTMLVideoElement): void {
+    if (this.hasAudioTrack(video)) {
+      video.muted = true
+      video.volume = 0
+    }
+  }
+
+  private hasAudioTrack (video: HTMLVideoElement): boolean {
+    const browserVideo = video as HTMLVideoElement & {
+      mozHasAudio?: boolean
+      webkitAudioDecodedByteCount?: number
+      audioTracks?: { length: number }
+    }
+
+    if (browserVideo.audioTracks !== undefined) return browserVideo.audioTracks.length > 0
+    if (typeof browserVideo.mozHasAudio === 'boolean') return browserVideo.mozHasAudio
+    if (typeof browserVideo.webkitAudioDecodedByteCount === 'number') return browserVideo.webkitAudioDecodedByteCount > 0
+
+    // If track presence is unknown, mute conservatively for safety.
     return true
   }
 
-  // A video nobody has judged yet goes ahead of one being resampled: the first
-  // is showing frames behind the pending-hide stylesheet, the second is already
-  // on screen and cleared.
-  private nextDue (): HTMLVideoElement {
-    for (const video of this.due) {
-      if (this.stateOf(video).approved < 0) return video
-    }
-
-    return this.due.values().next().value as HTMLVideoElement
+  private isDynamicAnalysisDisabledForCurrentHost (): boolean {
+    const hostname = window.location.hostname.toLowerCase()
+    return this.DYNAMIC_ANALYSIS_DISABLED_HOSTS.some(pattern => pattern.test(hostname))
   }
 
-  // One frame in flight per document. Frames are pulled from the DOM only when
-  // their turn comes, so a page full of videos costs one canvas, not one each.
-  private async drain (): Promise<void> {
-    if (this.sampling) return
-    this.sampling = true
-
-    try {
-      while (this.active && this.due.size > 0) {
-        const video = this.nextDue()
-        this.due.delete(video)
-        if (!video.isConnected) {
-          this.stateOf(video).observed = false
-          this.viewport.unobserve(video)
-          continue
-        }
-
-        // The queue is served one frame at a time, so what was worth sampling
-        // when it was queued may have scrolled away or been judged since.
-        if (!this.eligible(video, this.stateOf(video))) continue
-
-        await this.sample(video)
-      }
-    } finally {
-      this.sampling = false
-    }
-  }
-
-  private async sample (video: HTMLVideoElement): Promise<void> {
-    const state = this.stateOf(video)
-    const generation = state.generation
-    if (state.unsampleable || video.dataset.nsfwFilterStatus === 'nsfw') return
-
-    // Until a frame of this media has been cleared, the element is hidden. Later
-    // samples run behind a video the user is already watching: blocking on every
-    // one of them would blink the page every ten seconds.
-    const first = state.approved !== generation
-    if (first) {
-      video.dataset.nsfwFilterStatus = 'processing'
-      this.hideElement(video)
-    }
-
-    const frame = await this.captureFrame(video, state)
-    if (!this.stillCurrent(state, generation)) return
-    if (frame === null) {
-      if (first) this.markUnavailable(video)
-      return
-    }
-    // From here there is decoded footage on screen behind the hide, so nothing
-    // the poster says may put the element back until this verdict lands.
-    if (first) state.framePending = true
-
-    state.lastSampleTime = video.currentTime
-
-    try {
-      const { result } = await this.requestToAnalyzeImage(new PredictionRequest(frameKey(), frame))
-      if (first) state.framePending = false
-      if (!this.stillCurrent(state, generation)) return
-
-      if (result) {
-        this.block(video)
-      } else {
-        state.approved = generation
-        if (first) this.reveal(video)
-      }
-    } catch {
-      if (first) state.framePending = false
-      if (this.stillCurrent(state, generation) && first) this.markUnavailable(video)
-    }
-  }
-
-  // Filtering can be switched off, and the element can move to different media,
-  // while a frame is in flight. Either way this verdict no longer applies.
-  private stillCurrent (state: VideoState, generation: number): boolean {
-    return this.active && !state.overridden && state.generation === generation
-  }
-
-  // null means no frame to classify: either none has decoded within the deadline,
-  // or the canvas is tainted by media this document may not read back.
-  private async captureFrame (video: HTMLVideoElement, state: VideoState): Promise<string | null> {
-    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-      const decoded = await this.waitForFrame(video)
-      if (!decoded) return null
-    }
-
-    // A fresh canvas per capture: one tainted by a cross-origin video must not
-    // fail every capture after it.
-    const canvas = document.createElement('canvas')
-    canvas.width = FRAME_SIZE
-    canvas.height = FRAME_SIZE
-
-    try {
-      const context = canvas.getContext('2d')
-      if (context === null) return null
-
-      context.drawImage(video, 0, 0, FRAME_SIZE, FRAME_SIZE)
-
-      return canvas.toDataURL('image/jpeg', FRAME_QUALITY)
-    } catch {
-      // SecurityError: cross-origin media without CORS, or DRM. The page can play
-      // it, we cannot read it, and retrying costs the same every ten seconds.
-      state.unsampleable = true
-
-      return null
-    }
-  }
-
-  private async waitForFrame (video: HTMLVideoElement): Promise<boolean> {
-    return await new Promise(resolve => {
-      const settle = (decoded: boolean): void => {
-        window.clearTimeout(timer)
-        video.removeEventListener('loadeddata', onLoaded)
-        resolve(decoded)
-      }
-      const onLoaded = (): void => settle(true)
-
-      const timer = window.setTimeout(() => settle(false), FRAME_DEADLINE)
-      video.addEventListener('loadeddata', onLoaded)
-    })
-  }
-
-  private classifyPoster (video: HTMLVideoElement, state: VideoState): void {
-    const generation = state.generation
-    const posterGeneration = state.posterGeneration
-    const poster = video.poster
-    const current = (): boolean =>
-      this.stillCurrent(state, generation) && state.posterGeneration === posterGeneration && video.poster === poster
-
-    this.requestToAnalyzeImage(new PredictionRequest(poster))
-      .then(({ result }) => {
-        if (!current()) return
-
-        // A safe poster only clears the preview, never the footage behind it, so
-        // it does not count as an approved frame, and it cannot reveal footage a
-        // frame is still being judged for.
-        if (result) this.block(video)
-        else if (!state.framePending) this.reveal(video)
-      })
-      .catch(() => {
-        if (current() && !state.framePending) this.reveal(video)
-      })
-  }
-
-  private block (video: HTMLVideoElement): void {
-    if (video.dataset.nsfwFilterStatus !== 'nsfw') this.blockedItems++
-    video.dataset.nsfwFilterStatus = 'nsfw'
-    this.due.delete(video)
-    this.applyEffect(video)
-    video.pause()
-  }
-
-  // A frame and a poster can be in flight together, and either can come back
-  // first. Whichever loses the race must not put an unsafe video back on screen.
-  private reveal (video: HTMLVideoElement): void {
-    if (video.dataset.nsfwFilterStatus === 'nsfw') return
-
-    video.dataset.nsfwFilterStatus = 'sfw'
-    this.revealElement(video)
-  }
-
-  private markUnavailable (video: HTMLVideoElement): void {
-    if (video.dataset.nsfwFilterStatus === 'nsfw') return
-
-    video.dataset.nsfwFilterStatus = 'unavailable'
-    this.revealElement(video)
-  }
 }

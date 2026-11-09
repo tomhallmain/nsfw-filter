@@ -29,9 +29,11 @@ describe('Static images present at load', () => {
     expect(target.visibility).toBe('visible')
   })
 
-  test('tags an image below MIN_IMAGE_SIZE as sfw without hiding it', async () => {
+  // Untagged rather than 'sfw': the page-wide sweep blurs every image tagged
+  // 'sfw', and icons too small to classify should not be swept.
+  test('leaves an image below MIN_IMAGE_SIZE untagged and visible', async () => {
     const tiny = await read('tiny')
-    expect(tiny.status).toBe('sfw')
+    expect(tiny.status).toBeNull()
     expect(tiny.visibility).toBe('visible')
   })
 
@@ -39,7 +41,9 @@ describe('Static images present at load', () => {
     const leftovers = await page.evaluate(() =>
       [...document.images].filter(img => {
         const status = img.getAttribute('data-nsfw-filter-status')
-        return status === null || status === 'processing' || getComputedStyle(img).visibility === 'hidden'
+        const classifiable = img.width > 41 && img.height > 41
+        return (classifiable && status === null) || status === 'processing' ||
+          getComputedStyle(img).visibility === 'hidden'
       }).length
     )
     expect(leftovers).toBe(0)

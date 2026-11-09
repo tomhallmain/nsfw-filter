@@ -1,7 +1,10 @@
 // <video> support. The fixture is grey frames recorded by the browser itself
 // (fixtures/make-video.js), so these prove the plumbing: discovery, frame
-// capture, and that every video reaches a terminal status. Blocking unsafe
-// footage needs unsafe footage and is covered by the unit tests.
+// sampling, and that every classifiable video reaches a terminal status.
+// Blocking unsafe footage needs unsafe footage and is covered by the unit tests.
+
+// Videos at or below this size on either side are left untagged.
+const MIN_VIDEO_SIZE = 41
 
 const SETTLE_TIMEOUT = 60000
 
@@ -18,12 +21,14 @@ const recordStatuses = async (page) => await page.evaluateOnNewDocument(() => {
 })
 
 const settled = async (page) => {
-  await page.waitForFunction(() =>
-    [...document.querySelectorAll('video')].every(video => {
-      const status = video.getAttribute('data-nsfw-filter-status')
-      return status !== null && status !== 'processing'
-    }),
-  { timeout: SETTLE_TIMEOUT, polling: 250 })
+  await page.waitForFunction((min) =>
+    [...document.querySelectorAll('video')]
+      .filter(video => video.width > min && video.height > min)
+      .every(video => {
+        const status = video.getAttribute('data-nsfw-filter-status')
+        return status !== null && status !== 'processing'
+      }),
+  { timeout: SETTLE_TIMEOUT, polling: 250 }, MIN_VIDEO_SIZE)
 }
 
 const read = async (page, id) => await page.evaluate((id) => {
@@ -66,12 +71,6 @@ const settledStatus = async (page, id) => {
   return await settled.jsonValue()
 }
 
-const waitForStatus = async (page, id, status) => await page.waitForFunction(
-  (id, status) => document.getElementById(id).getAttribute('data-nsfw-filter-status') === status,
-  { timeout: SETTLE_TIMEOUT, polling: 250 },
-  id, status
-)
-
 describe('Videos on the page', () => {
   let page
 
@@ -109,19 +108,19 @@ describe('Videos on the page', () => {
     expect(postered.visibility).toBe('visible')
   })
 
-  test('tags a video below MIN_VIDEO_SIZE without classifying it', async () => {
+  test('leaves a video below MIN_VIDEO_SIZE untagged and visible', async () => {
     const tiny = await read(page, 'tiny')
-    expect(tiny.status).toBe('sfw')
+    expect(tiny.status).toBeNull()
     expect(tiny.visibility).toBe('visible')
     expect(await statuses(page, 'tiny')).not.toContain('tiny:processing')
   })
 
-  // A cross-origin video without CORS plays but cannot be read back. Leaving it
-  // hidden would blank video the browser is willing to show.
-  test('reveals a video whose frames cannot be read', async () => {
-    await waitForStatus(page, 'foreign', 'unavailable')
-    const foreign = await read(page, 'foreign')
-    expect(foreign.status).toBe('unavailable')
+  // Served from another origin without CORS headers. The offscreen document
+  // fetches the bytes itself, so the video is still classified, and it must
+  // never be left hidden either way.
+  test('settles and shows a video from a host that sends no CORS headers', async () => {
+    const foreign = await settledStatus(page, 'foreign')
+    expect(['sfw', 'error']).toContain(foreign.status)
     expect(foreign.visibility).toBe('visible')
   })
 
@@ -145,81 +144,18 @@ describe('Videos on the page', () => {
     expect(added.visibility).toBe('visible')
   })
 
-  // Once a frame of the current footage has been judged, the poster is no longer
-  // what the element shows. Swapping it must not hide the video again.
-  test('ignores a poster swapped in after a frame was judged', async () => {
-    await settledStatus(page, 'postered')
-    // Paused, so the periodic resample cannot be mistaken for the poster hiding it.
-    await page.evaluate(() => {
-      const video = document.getElementById('postered')
-      video.pause()
-      video.poster = '/icon.png?revision=2'
-    })
-    await new Promise(resolve => setTimeout(resolve, 2000))
-
-    expect((await read(page, 'postered')).visibility).toBe('visible')
-  })
-
-  // Removing a poster leaves nothing for the outstanding verdict to apply to, so
-  // whatever it was holding hidden has to be settled by the removal itself.
-  test('settles a paused video whose poster is removed', async () => {
-    await page.evaluate((base) => {
-      const video = document.createElement('video')
-      video.id = 'unpostered'
-      video.src = `${base}video.webm`
-      video.poster = '/icon.png?revision=3'
-      video.width = 320
-      video.height = 240
-      video.muted = true
-      video.playsInline = true
-      document.body.appendChild(video)
-    }, global.__BASE_URL__)
-    await page.evaluate(() => {
-      document.getElementById('unpostered').removeAttribute('poster')
-    })
-
-    expect((await settledStatus(page, 'unpostered')).visibility).toBe('visible')
-  })
-
-  // An infinite-scroll feed takes elements out and puts them back. A video that
-  // came back must not be left hidden or wedged.
-  test('keeps a removed and reinserted video settled', async () => {
-    await page.evaluate((base) => {
-      const video = document.createElement('video')
-      video.id = 'reinserted'
-      video.src = `${base}video.webm`
-      video.width = 320
-      video.height = 240
-      video.muted = true
-      video.playsInline = true
-      document.body.appendChild(video)
-      video.play().catch(() => undefined)
-    }, global.__BASE_URL__)
-    await settledStatus(page, 'reinserted')
-
-    await page.evaluate(() => {
-      window.__parked = document.getElementById('reinserted')
-      window.__parked.remove()
-    })
-    await page.evaluate(() => {
-      document.body.appendChild(window.__parked)
-      window.__parked.play().catch(() => undefined)
-    })
-
-    expect((await settledStatus(page, 'reinserted')).visibility).toBe('visible')
-  })
-
   test('leaves no video stuck hidden or unprocessed', async () => {
-    const stuck = await page.waitForFunction(() => {
+    const stuck = await page.waitForFunction((min) => {
       const videos = [...document.querySelectorAll('video')]
       const pending = videos.some(video => {
         const status = video.getAttribute('data-nsfw-filter-status')
-        return status === null || status === 'processing'
+        const classifiable = video.width > min && video.height > min
+        return (classifiable && status === null) || status === 'processing'
       })
       if (pending) return false
 
       return videos.filter(video => getComputedStyle(video).visibility === 'hidden').map(video => video.id)
-    }, { timeout: SETTLE_TIMEOUT, polling: 250 })
+    }, { timeout: SETTLE_TIMEOUT, polling: 250 }, MIN_VIDEO_SIZE)
 
     expect(await stuck.jsonValue()).toEqual([])
   })

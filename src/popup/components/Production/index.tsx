@@ -3,10 +3,10 @@ import { ChevronDown, ChevronUp, Contrast, Droplet, EyeOff } from 'lucide-react'
 import React, { useState } from 'react'
 import { useSelector, useDispatch } from 'react-redux'
 
-import { TRAINED_MODELS, TRAINED_MODEL_LABELS, TrainedModel } from '../../../utils/models'
+import { CLASSIFIER_BACKENDS, CLASSIFIER_BACKEND_LABELS, ClassifierBackend } from '../../../utils/models'
 import { setFilterStrictness } from '../../redux/actions/settings'
 import {
-  setTrainedModel,
+  setClassifierBackend,
   setFilterEffect,
   toggleEnabled,
   toggleLogging
@@ -44,7 +44,7 @@ export const Production: React.FC = () => {
   const {
     enabled,
     filterStrictness,
-    trainedModel,
+    classifierBackend,
     filterEffect,
     logging
   } = useSelector<RootState>((state) => state.settings) as SettingsState
@@ -117,12 +117,12 @@ export const Production: React.FC = () => {
         {advancedOpen && (
           <AdvancedPanel id="advanced-panel">
             <AdvancedRow>
-              <FieldLabel>Trained model</FieldLabel>
-              <Select<TrainedModel>
-                value={trainedModel}
+              <FieldLabel>Classifier</FieldLabel>
+              <Select<ClassifierBackend>
+                value={classifierBackend}
                 style={{ width: 170 }}
-                onChange={value => dispatch(setTrainedModel(value))}
-                options={TRAINED_MODELS.map(value => ({ value, label: TRAINED_MODEL_LABELS[value] }))}
+                onChange={value => dispatch(setClassifierBackend(value))}
+                options={CLASSIFIER_BACKENDS.map(value => ({ value, label: CLASSIFIER_BACKEND_LABELS[value] }))}
               />
             </AdvancedRow>
             <Checkbox checked={logging} onChange={() => dispatch(toggleLogging())}>

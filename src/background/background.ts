@@ -1,158 +1,174 @@
 import { createStore } from 'redux'
 
-import { SettingsActionTypes } from '../popup/redux/actions/settings'
-import { StatisticsActionTypes } from '../popup/redux/actions/statistics'
 import { createChromeStore } from '../popup/redux/chrome-storage'
-import { rootReducer, RootState } from '../popup/redux/reducers'
+import { rootReducer } from '../popup/redux/reducers'
+import { SettingsState } from '../popup/redux/reducers/settings'
 import { ILogger, Logger } from '../utils/Logger'
-import { CONTEXT_TARGET, ContextTargetMessage, PredictionResponse, UNHIDE_IMAGE } from '../utils/messages'
+import {
+  CONTEXT_TARGET,
+  ContextTargetMessage,
+  AutoDlFile,
+  PredictionResponse,
+  UNHIDE_IMAGE
+} from '../utils/messages'
 
+import { isAutoDlFramePairMessage, saveAutoDlFramePair } from './autoDlDownloads'
+import { ClassifierSettings } from './classifier/MediaClassifier'
+import { DynamicMediaScheduler, DynamicMediaSchedulerSettings } from './media/DynamicMediaScheduler'
 import { OffscreenModel } from './OffscreenModel'
-import { DEFAULT_TAB_ID, TabIdUrl } from './Queue/QueueBase'
+import { ensureOffscreenDocument, OFFSCREEN_DOCUMENT_PATH } from './offscreenLifecycle'
+import { DEFAULT_TAB_ID } from './Queue/QueueBase'
 import { QueueWrapper as Queue } from './Queue/QueueWrapper'
-
-// The Manifest V3 background page is a non-persistent service worker with no DOM
-// and no eval, so it can't run TensorFlow.js itself. It keeps the orchestration
-// (queue, cache, per-tab tracking, statistics, redux) and delegates image
-// download and classification to an offscreen document. Listeners are registered
-// synchronously at the top level so the worker can handle events after a restart.
-
-export type IReduxedStorage = {
-  getState: () => RootState
-  dispatch: (action: SettingsActionTypes | StatisticsActionTypes) => Promise<void> // returns dispatchedAction
-}
+import { buildTabIdUrl } from './tabUtils'
+import { IReduxedStorage } from './types'
 
 type Runtime = {
   logger: ILogger
   store: IReduxedStorage
   model: OffscreenModel
   queue: Queue
+  dynamicMediaScheduler: DynamicMediaScheduler
 }
 
-const OFFSCREEN_DOCUMENT_PATH = 'src/offscreen.html'
+type IncomingMessage = {
+  target?: string
+  type?: string
+  url?: unknown
+  mediaType?: 'image' | 'video' | 'gif'
+  filtered?: boolean
+}
 
-const _buildTabIdUrl = (tab?: chrome.tabs.Tab): TabIdUrl => {
-  return {
-    tabId: tab?.id ? tab.id : DEFAULT_TAB_ID,
-    tabUrl: tab?.url ? tab.url : `${DEFAULT_TAB_ID}`
+// @types/chrome is older than MV3 action / contextMenus promise APIs.
+type ActionApi = {
+  setBadgeText: (details: { text: string }) => Promise<void> | void
+  setBadgeBackgroundColor: (details: { color: string }) => Promise<void> | void
+}
+type ContextMenusApi = {
+  removeAll: (callback?: () => void) => void
+  create: (createProperties: Record<string, unknown>) => void
+  update: (id: string, updateProperties: Record<string, unknown>) => Promise<void> | void
+  onClicked: {
+    addListener: (callback: (info: { menuItemId: string | number, frameId?: number }, tab?: chrome.tabs.Tab) => void) => void
   }
 }
 
-// --- Offscreen document lifecycle -----------------------------------------
-
-// @types/chrome (0.0.122) predates the MV3 offscreen and getContexts APIs, so
-// the slices we call are declared here.
-type OffscreenApi = {
-  createDocument: (parameters: { url: string, reasons: string[], justification: string }) => Promise<void>
-  hasDocument?: () => Promise<boolean>
-}
-type RuntimeWithContexts = {
-  getContexts?: (filter: { contextTypes: string[] }) => Promise<unknown[]>
+// "downloads" is an optional permission: chrome.downloads is undefined until
+// the user grants it by turning on frame auto-download in the popup.
+type DownloadsApi = {
+  download: (
+    options: { url: string, filename: string, saveAs: boolean, conflictAction: 'uniquify' },
+    callback: (downloadId?: number) => void
+  ) => void
 }
 
-const getOffscreenApi = (): OffscreenApi => (chrome as unknown as { offscreen: OffscreenApi }).offscreen
+const actionApi = (chrome as unknown as { action: ActionApi }).action
+const contextMenusApi = (chrome as unknown as { contextMenus: ContextMenusApi }).contextMenus
+const getDownloadsApi = (): DownloadsApi | undefined => (chrome as unknown as { downloads?: DownloadsApi }).downloads
 
-let creatingOffscreen: Promise<void> | null = null
+const UNHIDE_MENU_ID = 'nsfw-filter-unhide'
 
-const hasOffscreenDocument = async (): Promise<boolean> => {
-  const runtime = chrome.runtime as unknown as RuntimeWithContexts
-  if (typeof runtime.getContexts === 'function') {
-    const contexts = await runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] })
-    return contexts.length > 0
-  }
+const buildClassifierSettings = (settings: SettingsState): ClassifierSettings => ({
+  filterStrictness: settings.filterStrictness,
+  logging: settings.logging,
+  classifierBackend: settings.classifierBackend,
+  dynamicSampleRatio: settings.dynamicSampleRatio,
+  dynamicPositiveRatio: settings.dynamicPositiveRatio,
+  dynamicMinSamples: settings.dynamicMinSamples,
+  dynamicMaxSamples: settings.dynamicMaxSamples,
+  dynamicMaxSampleDurationSeconds: 45,
+  autoDlFramesEnabled: settings.autoDlFramesEnabled,
+  autoDlSignatureThreshold: settings.autoDlSignatureThreshold,
+  autoDlMaxPairsPerVideo: settings.autoDlMaxPairsPerVideo,
+  autoDlMaxPairsPerSession: settings.autoDlMaxPairsPerSession
+})
 
-  // Older Chrome builds expose offscreen.hasDocument() instead of getContexts.
-  const offscreen = getOffscreenApi()
-  if (offscreen.hasDocument !== undefined) {
-    return await offscreen.hasDocument()
-  }
+const getDynamicSettings = (settings: SettingsState): Partial<DynamicMediaSchedulerSettings> => ({
+  sampleRatio: settings.dynamicSampleRatio,
+  positiveRatio: settings.dynamicPositiveRatio,
+  minSamples: settings.dynamicMinSamples,
+  maxSamples: settings.dynamicMaxSamples,
+  maxConcurrentGlobal: settings.dynamicMaxConcurrentGlobal,
+  maxConcurrentPerTab: settings.dynamicMaxConcurrentPerTab,
+  queueLimitPerTab: settings.dynamicQueueLimitPerTab
+})
 
-  return false
-}
-
-const ensureOffscreenDocument = async (): Promise<void> => {
-  if (await hasOffscreenDocument()) return
-
-  if (creatingOffscreen !== null) {
-    await creatingOffscreen
-    return
-  }
-
-  creatingOffscreen = getOffscreenApi().createDocument({
-    url: OFFSCREEN_DOCUMENT_PATH,
-    reasons: ['DOM_SCRAPING'],
-    justification: 'Load images into an <img> element and run the TensorFlow.js NSFW classification model, which require DOM APIs unavailable in a service worker.'
-  })
-
+const refreshActionBadge = (enabled: boolean): void => {
   try {
-    await creatingOffscreen
-  } finally {
-    creatingOffscreen = null
+    Promise.resolve(actionApi.setBadgeText({ text: enabled ? '' : 'OFF' })).catch(() => undefined)
+    Promise.resolve(actionApi.setBadgeBackgroundColor({ color: '#71717f' })).catch(() => undefined)
+  } catch {
+    // Older runtimes without action API.
   }
 }
 
-// --- Lazy runtime initialisation ------------------------------------------
+const downloadFile = (api: DownloadsApi) => async (file: AutoDlFile): Promise<void> => {
+  await new Promise<void>((resolve, reject) => {
+    api.download({ url: file.dataUrl, filename: file.filename, saveAs: false, conflictAction: 'uniquify' }, (downloadId) => {
+      const lastError = chrome.runtime.lastError
+      if (lastError !== undefined && lastError !== null) reject(new Error(lastError.message ?? 'Download failed'))
+      else if (downloadId === undefined) reject(new Error('Download did not start'))
+      else resolve()
+    })
+  })
+}
+
+const createUnhideMenu = (): void => {
+  contextMenusApi.removeAll(() => {
+    contextMenusApi.create({
+      id: UNHIDE_MENU_ID,
+      title: 'Unhide this image (NSFW Filter)',
+      contexts: ['image'],
+      visible: false
+    })
+  })
+}
 
 let runtimePromise: Promise<Runtime> | null = null
 
 const initRuntime = async (): Promise<Runtime> => {
   await ensureOffscreenDocument()
 
-  const store = await createChromeStore({ createStore })(rootReducer)
-  const { enabled, logging, filterStrictness, trainedModel } = store.getState().settings
-  refreshActionBadge(enabled)
+  const store = await createChromeStore({ createStore })(rootReducer) as IReduxedStorage
+  const settings = store.getState().settings
+  refreshActionBadge(settings.enabled)
 
   const logger = new Logger()
-  if (logging === true) logger.enable()
+  if (settings.logging === true) logger.enable()
 
   const model = new OffscreenModel()
-  model.setSettings(filterStrictness, logging, trainedModel)
+  model.setSettings(buildClassifierSettings(settings))
 
   const queue = new Queue(model, logger, store)
+  const dynamicMediaScheduler = new DynamicMediaScheduler(model, logger, getDynamicSettings(settings))
 
-  // reduxed keeps this worker's store synced with storage, so a popup change
-  // lands here even while the popup is open. Propagate live: mirror `enabled`
-  // onto the badge, and push model/strictness/logging to the offscreen document
-  // as they change (it swaps the model in place, gated on its prediction chain).
-  // Guard on change so per-image statistics ticks don't trigger any of this.
-  let applied = { enabled, logging, filterStrictness, trainedModel }
+  let lastClassifierKey = JSON.stringify(buildClassifierSettings(settings))
+  let badgeEnabled = settings.enabled
   store.subscribe(() => {
     const next = store.getState().settings
-    if (next.enabled !== applied.enabled) refreshActionBadge(next.enabled)
-
-    if (
-      next.logging !== applied.logging ||
-      next.filterStrictness !== applied.filterStrictness ||
-      next.trainedModel !== applied.trainedModel
-    ) {
-      if (next.logging) logger.enable()
-      else logger.disable()
-      model.setSettings(next.filterStrictness, next.logging, next.trainedModel)
-      // Only a new verdict invalidates cached predictions; a logging toggle
-      // doesn't, so don't force re-classification of already-seen images for it.
-      if (next.filterStrictness !== applied.filterStrictness || next.trainedModel !== applied.trainedModel) {
-        queue.clearCache()
-      }
+    if (next.enabled !== badgeEnabled) {
+      badgeEnabled = next.enabled
+      refreshActionBadge(next.enabled)
     }
 
-    applied = {
-      enabled: next.enabled,
-      logging: next.logging,
-      filterStrictness: next.filterStrictness,
-      trainedModel: next.trainedModel
+    const classifierSettings = buildClassifierSettings(next)
+    const classifierKey = JSON.stringify(classifierSettings)
+    if (classifierKey !== lastClassifierKey) {
+      lastClassifierKey = classifierKey
+      model.setSettings(classifierSettings)
+      dynamicMediaScheduler.setSettings(getDynamicSettings(next))
+      queue.clearCache()
+      dynamicMediaScheduler.clearCache()
     }
   })
 
-  // The worker may have been restarted, losing the per-tab map. Reseed it from
-  // the currently open tabs so in-flight prediction guards stay accurate.
   try {
     const tabs = await new Promise<chrome.tabs.Tab[]>((resolve) => chrome.tabs.query({}, resolve))
-    for (const tab of tabs) queue.addTabIdUrl(_buildTabIdUrl(tab))
+    for (const tab of tabs) queue.addTabIdUrl(buildTabIdUrl(tab))
   } catch (error) {
     logger.error(error as Error)
   }
 
-  return { logger, store, model, queue }
+  return { logger, store, model, queue, dynamicMediaScheduler }
 }
 
 const getRuntime = async (): Promise<Runtime> => {
@@ -161,133 +177,115 @@ const getRuntime = async (): Promise<Runtime> => {
   try {
     return await runtimePromise
   } catch (error) {
-    // Allow a later event to retry from scratch instead of caching a failure.
     runtimePromise = null
     throw error
   }
 }
 
-// A small "OFF" badge on the toolbar icon mirrors the popup's on/off switch, so
-// the disabled state is visible without opening the popup.
-const refreshActionBadge = (enabled: boolean): void => {
-  chrome.action.setBadgeText({ text: enabled ? '' : 'OFF' }).catch(() => undefined)
-  chrome.action.setBadgeBackgroundColor({ color: '#71717f' }).catch(() => undefined)
+const applySettingsFromStore = (runtime: Runtime): void => {
+  const settings = runtime.store.getState().settings
+
+  refreshActionBadge(settings.enabled)
+  if (settings.logging) runtime.logger.enable()
+  else runtime.logger.disable()
+  runtime.model.setSettings(buildClassifierSettings(settings))
+  runtime.dynamicMediaScheduler.setSettings(getDynamicSettings(settings))
+  runtime.queue.clearCache()
+  runtime.dynamicMediaScheduler.clearCache()
 }
 
-// --- Right-click "unhide" context menu ------------------------------------
-
-const UNHIDE_MENU_ID = 'nsfw-filter-unhide'
-
-// Created hidden; the content script flips it visible only while the cursor is
-// over media this extension filtered (see CONTEXT_TARGET below).
-const createUnhideMenu = (): void => {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: UNHIDE_MENU_ID,
-      title: 'Unhide this (NSFW Filter)',
-      contexts: ['image', 'video'],
-      visible: false
-    })
-  })
-}
-
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId !== UNHIDE_MENU_ID || tab?.id === undefined) return
-  // Target the exact frame that reported the image, not the whole tab.
-  chrome.tabs.sendMessage(tab.id, { type: UNHIDE_IMAGE }, { frameId: info.frameId }).catch(() => undefined)
-})
-
-// --- Event listeners (registered synchronously) ---------------------------
-
-// Content scripts report, on each right-click, whether the cursor is over an
-// image we filtered, so the menu item only appears over reversible images.
 chrome.runtime.onMessage.addListener((message: ContextTargetMessage) => {
   if (message?.type !== CONTEXT_TARGET) return
-  chrome.contextMenus.update(UNHIDE_MENU_ID, { visible: message.filtered === true }).catch(() => undefined)
+  Promise.resolve(contextMenusApi.update(UNHIDE_MENU_ID, { visible: message.filtered === true })).catch(() => undefined)
 })
 
-// Any message reaching this listener: a content-script classification request,
-// plus the offscreen and SIGN_CONNECT messages that are handled elsewhere.
-type IncomingMessage = {
-  target?: string
-  type?: string
-  url?: unknown
-  source?: unknown
-}
+chrome.runtime.onMessage.addListener((message: unknown, sender) => {
+  if (!isAutoDlFramePairMessage(message)) return
 
-// Image classification requests coming from content scripts.
+  getRuntime()
+    .then(async ({ store, logger }) => {
+      const downloads = getDownloadsApi()
+      await saveAutoDlFramePair(message, sender.url, {
+        offscreenUrl: chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH),
+        isEnabled: async () => store.getState().settings.autoDlFramesEnabled,
+        download: downloads === undefined ? undefined : downloadFile(downloads),
+        log: text => logger.log(text)
+      })
+    })
+    .catch(() => undefined)
+})
+
+contextMenusApi.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== UNHIDE_MENU_ID || tab?.id === undefined) return
+  chrome.tabs.sendMessage(tab.id, { type: UNHIDE_IMAGE }, { frameId: info.frameId }, () => {
+    if (chrome.runtime.lastError !== undefined) { /* handled */ }
+  })
+})
+
 chrome.runtime.onMessage.addListener((request: IncomingMessage, sender, sendResponse: (value: PredictionResponse) => void) => {
-  // Messages addressed to the offscreen document are handled there, not here.
   if (request?.target === 'offscreen') return
+  if (request?.target === 'background') return
   if (request?.type === 'SIGN_CONNECT') return
+  if (request?.type === CONTEXT_TARGET) return
   if (typeof request?.url !== 'string') return
 
   const { url } = request
-  const source = typeof request.source === 'string' ? request.source : undefined
+  const mediaType = request.mediaType ?? 'image'
 
   getRuntime()
-    .then(({ queue }) => {
-      const tabIdUrl = _buildTabIdUrl(sender.tab)
-      // Guarantee the requesting tab is known even after a worker restart.
+    .then(({ store, queue, dynamicMediaScheduler }) => {
+      if (store.getState().settings.enabled !== true) {
+        sendResponse(new PredictionResponse(false, url, undefined, mediaType))
+        return
+      }
+
+      const tabIdUrl = buildTabIdUrl(sender.tab)
       queue.addTabIdUrl(tabIdUrl)
 
-      queue.predict(url, tabIdUrl, source)
-        .then(result => sendResponse(new PredictionResponse(result, url)))
-        .catch(err => sendResponse(new PredictionResponse(false, url, err.message)))
+      const predictionPromise = (mediaType === 'video' || mediaType === 'gif')
+        ? dynamicMediaScheduler.predict(url, tabIdUrl, mediaType)
+        : queue.predict(url, tabIdUrl)
+
+      predictionPromise
+        .then(result => sendResponse(PredictionResponse.fromClassification(result, url, mediaType)))
+        .catch(err => sendResponse(new PredictionResponse(false, url, err.message, mediaType)))
     })
-    .catch(err => sendResponse(new PredictionResponse(false, url, err?.message)))
+    .catch(err => sendResponse(new PredictionResponse(false, url, err?.message, mediaType)))
 
-  return true // https://stackoverflow.com/a/56483156
+  return true
 })
 
-// When user opened a new tab
 chrome.tabs.onCreated.addListener((tab) => {
-  getRuntime().then(({ queue }) => queue.addTabIdUrl(_buildTabIdUrl(tab))).catch(() => undefined)
+  getRuntime().then(({ queue }) => queue.addTabIdUrl(buildTabIdUrl(tab))).catch(() => undefined)
 })
 
-// When user closed a tab
 chrome.tabs.onRemoved.addListener((tabId) => {
-  getRuntime().then(({ queue }) => queue.clearByTabId(tabId)).catch(() => undefined)
+  getRuntime().then(({ queue, dynamicMediaScheduler }) => {
+    queue.clearByTabId(tabId)
+    dynamicMediaScheduler.clearByTabId(tabId)
+  }).catch(() => undefined)
 })
 
-// When user went to a new url in the same tab
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'loading') {
-    getRuntime().then(({ queue }) => queue.updateTabIdUrl(_buildTabIdUrl(tab))).catch(() => undefined)
-  }
+  if (changeInfo.status !== 'loading') return
+
+  getRuntime().then(({ queue, dynamicMediaScheduler }) => {
+    dynamicMediaScheduler.clearByTabId(tab.id ?? DEFAULT_TAB_ID)
+    queue.updateTabIdUrl(buildTabIdUrl(tab))
+  }).catch(() => undefined)
 })
 
-// When user selected a tab as active
 chrome.tabs.onActivated.addListener((activeInfo) => {
   getRuntime().then(({ queue }) => queue.setActiveTabId(activeInfo.tabId)).catch(() => undefined)
 })
 
-// When the popup window is closed, reload settings and clear the cache so new
-// strictness/logging settings take effect immediately.
 chrome.runtime.onConnect.addListener(port => port.onDisconnect.addListener(() => {
   getRuntime()
-    .then(({ store, logger, model, queue }) => {
-      const { enabled, logging, filterStrictness, trainedModel } = store.getState().settings
-      refreshActionBadge(enabled)
-
-      if (logging) logger.enable()
-      else logger.disable()
-      model.setSettings(filterStrictness, logging, trainedModel)
-
-      queue.clearCache()
-    })
+    .then(applySettingsFromStore)
     .catch(() => undefined)
 }))
 
-// Warm the model up front so the first image on a page isn't slow. The worker
-// spins down after ~30s idle, but an offscreen document opened with the
-// DOM_SCRAPING reason has no idle timeout and outlives the worker, so the loaded
-// model stays resident across restarts and ensureOffscreenDocument() reuses it.
-// Pre-warm on install and on startup, plus whenever the worker first spins up.
 chrome.runtime.onInstalled.addListener(() => { getRuntime().catch(() => undefined) })
 chrome.runtime.onStartup.addListener(() => { getRuntime().catch(() => undefined) })
-// Recreate the menu on every worker spin-up, not just onInstalled/onStartup:
-// disabling then re-enabling the extension tears the menu down but fires neither
-// event, which would otherwise leave the unhide item gone until a browser restart.
 createUnhideMenu()
 getRuntime().catch(() => undefined)

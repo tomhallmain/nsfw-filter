@@ -1,6 +1,6 @@
 import { Model } from '../../src/background/Model'
 
-describe.only('background => Model => handleFilterStrictness', () => {
+describe('background => Model => handleFilterStrictness', () => {
     const data = [
         { value: 1, expected: 0.98 },
         { value: 100, expected: 0.4 },

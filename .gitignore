@@ -3,6 +3,7 @@ dist/src
 node_modules
 dev
 CLAUDE.md
+docs/
 TODO.md
 .DS_Store
 
@@ -11,3 +12,10 @@ TODO.md
 
 # Local model-comparison benchmark harness — kept out of the repo
 benchmark/
+
+# Runtime binaries copied in from node_modules by the build
+dist/models/*.wasm
+dist/models/onnx/ort/
+# Custom ONNX weights are supplied locally, not committed
+dist/models/onnx/*.onnx
+dist/models/onnx/*.onnx.data

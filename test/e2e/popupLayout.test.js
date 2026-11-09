@@ -69,7 +69,7 @@ describe('Popup layout', () => {
     })
     await settle(300)
     const text = await page.evaluate(() => document.getElementById('popup').textContent)
-    expect(text).toContain('Trained model')
+    expect(text).toContain('Classifier')
     expect(text).toContain('Show logs in browser console')
     expect(await measureOverflow(page)).toEqual([])
   })

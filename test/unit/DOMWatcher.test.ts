@@ -1,216 +1,184 @@
 /**
  * @jest-environment jsdom
  */
+
 import { DOMWatcher } from '../../src/content/DOMWatcher/DOMWatcher'
-import { IBackgroundImageFilter } from '../../src/content/Filter/BackgroundImageFilter'
-import { IImageFilter, ImageFilter } from '../../src/content/Filter/ImageFilter'
+import { IBackgroundFilter } from '../../src/content/Filter/BackgroundFilter'
+import { BackgroundCandidate, invalidateSelectorCache } from '../../src/content/Filter/backgroundScan'
+import { IImageFilter } from '../../src/content/Filter/ImageFilter'
 import { IVideoFilter } from '../../src/content/Filter/VideoFilter'
 
-const flushMutations = async (): Promise<void> => await Promise.resolve()
+/** Longer than the watcher's scan debounce. */
+const AFTER_DEBOUNCE_MS = 200
 
-const makeFilter = (): IImageFilter => ({
-  analyzeImage: jest.fn(),
+/** jsdom lays nothing out, so an element a scan should accept needs a box. */
+const sizeAll = (selector: string): void => {
+  document.querySelectorAll(selector).forEach(element => {
+    element.getBoundingClientRect = () => ({
+      width: 300, height: 400, top: 0, left: 0, right: 300, bottom: 400, x: 0, y: 0, toJSON: () => ({})
+    })
+  })
+}
+
+const buildBackgroundFilter = (): IBackgroundFilter => ({
+  analyzeCandidates: jest.fn(),
   setSettings: jest.fn(),
-  revealImage: jest.fn(),
-  checkStyleMutation: jest.fn()
+  revealElement: jest.fn(),
+  revealSweptBackgrounds: jest.fn()
 })
 
-const makeVideoFilter = (): IVideoFilter => ({
-  analyzeVideo: jest.fn(),
-  checkPoster: jest.fn(),
-  revealVideo: jest.fn(),
-  checkStyleMutation: jest.fn(),
-  applyEffectToBlocked: jest.fn(),
-  revealAll: jest.fn(),
-  start: jest.fn(),
-  stop: jest.fn()
+/** Every url the filter was handed, across all the scans so far. */
+const scanned = (filter: IBackgroundFilter): string[] =>
+  (filter.analyzeCandidates as jest.Mock).mock.calls
+    .flatMap(([candidates]: [BackgroundCandidate[]]) => candidates.map(candidate => candidate.url))
+
+/** MutationObserver delivers on a microtask; the scan it queues runs on a timer. */
+const settle = async (): Promise<void> => {
+  for (let i = 0; i < 20; i++) await Promise.resolve()
+  jest.advanceTimersByTime(AFTER_DEBOUNCE_MS)
+  for (let i = 0; i < 20; i++) await Promise.resolve()
+}
+
+const buildFilters = (): { imageFilter: IImageFilter, videoFilter: IVideoFilter } => ({
+  imageFilter: { analyzeImage: jest.fn(), setSettings: jest.fn() } as unknown as IImageFilter,
+  videoFilter: { analyzeVideo: jest.fn(), setSettings: jest.fn() } as unknown as IVideoFilter
 })
 
-const makeBackgroundFilter = (): IBackgroundImageFilter => ({
-  observe: jest.fn(),
-  release: jest.fn(),
-  recheckVisible: jest.fn(),
-  checkElement: jest.fn(),
-  checkStyleMutation: jest.fn(),
-  applyEffectToBlocked: jest.fn(),
-  revealAll: jest.fn(),
-  start: jest.fn(),
-  stop: jest.fn()
-})
-
-afterEach(() => { document.body.innerHTML = '' })
-
-describe('content => DOMWatcher => watch', () => {
-  test('checks images already in the DOM when watching starts', () => {
-    document.body.innerHTML = '<img id="a"><img id="b">'
-    const filter = makeFilter()
-
-    new DOMWatcher(filter, makeVideoFilter(), makeBackgroundFilter()).watch()
-
-    expect(filter.analyzeImage).toHaveBeenCalledTimes(2)
-    expect(filter.analyzeImage).toHaveBeenCalledWith(document.getElementById('a'), false)
-    expect(filter.analyzeImage).toHaveBeenCalledWith(document.getElementById('b'), false)
+describe('content => DOMWatcher', () => {
+  beforeEach(() => {
+    document.body.innerHTML = ''
   })
 
-  test('checks images added after watching starts', async () => {
-    const filter = makeFilter()
-    new DOMWatcher(filter, makeVideoFilter(), makeBackgroundFilter()).watch()
+  test('analyzes media that was already in the document when watching started', () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    const image = document.createElement('img')
+    image.src = 'https://example.com/a.jpg'
+    const video = document.createElement('video')
+    video.src = 'https://example.com/a.mp4'
+    document.body.appendChild(image)
+    document.body.appendChild(video)
 
-    document.body.appendChild(document.createElement('img'))
-    await flushMutations()
+    new DOMWatcher(imageFilter, videoFilter).watch()
 
-    expect(filter.analyzeImage).toHaveBeenCalledTimes(1)
+    expect(imageFilter.analyzeImage).toHaveBeenCalledWith(image, false)
+    expect(videoFilter.analyzeVideo).toHaveBeenCalledWith(video, false)
   })
 
-  test('reanalyzes an image when its src attribute changes', async () => {
-    document.body.innerHTML = '<img id="a">'
-    const filter = makeFilter()
-    new DOMWatcher(filter, makeVideoFilter(), makeBackgroundFilter()).watch();
-    (filter.analyzeImage as jest.Mock).mockClear()
+  test('analyzes media added after watching started', async () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    new DOMWatcher(imageFilter, videoFilter).watch()
 
-    document.getElementById('a')!.setAttribute('src', 'http://example.com/a.jpg')
-    await flushMutations()
+    const video = document.createElement('video')
+    video.src = 'https://example.com/late.mp4'
+    document.body.appendChild(video)
 
-    expect(filter.analyzeImage).toHaveBeenCalledWith(document.getElementById('a'), true)
-  })
-})
+    await new Promise(resolve => setTimeout(resolve, 0))
 
-// Live enable/disable and allowlist toggles have to start and stop watching on
-// an already-open page without a reload, so watch() must be idempotent and
-// unwatch() must stop reporting future mutations.
-describe('content => DOMWatcher => start/stop live', () => {
-  test('sweeps existing images once even if watch() is called twice', () => {
-    document.body.innerHTML = '<img id="a">'
-    const filter = makeFilter()
-
-    const watcher = new DOMWatcher(filter, makeVideoFilter(), makeBackgroundFilter())
-    watcher.watch()
-    watcher.watch()
-
-    expect(filter.analyzeImage).toHaveBeenCalledTimes(1)
+    expect(videoFilter.analyzeVideo).toHaveBeenCalledWith(video, false)
   })
 
-  test('unwatch stops reacting to later mutations', async () => {
-    const filter = makeFilter()
-    const watcher = new DOMWatcher(filter, makeVideoFilter(), makeBackgroundFilter())
-    watcher.watch()
-    watcher.unwatch();
-    (filter.analyzeImage as jest.Mock).mockClear()
+  test('leaves an empty document alone', () => {
+    const { imageFilter, videoFilter } = buildFilters()
 
-    document.body.appendChild(document.createElement('img'))
-    await flushMutations()
+    new DOMWatcher(imageFilter, videoFilter).watch()
 
-    expect(filter.analyzeImage).not.toHaveBeenCalled()
+    expect(imageFilter.analyzeImage).not.toHaveBeenCalled()
+    expect(videoFilter.analyzeVideo).not.toHaveBeenCalled()
   })
 })
 
-// Instagram (and Google) rewrite an image's inline style on every re-render,
-// wiping the effect we applied so the blocked image reappears. The observer has
-// to react to style changes, not just src, and re-apply the effect. Issue #244.
-describe('content => DOMWatcher => style rewrites (issue #244)', () => {
-  test('re-hides a blocked image after the page rewrites its style attribute', async () => {
-    document.body.innerHTML = '<img id="a" src="http://example.com/a.jpg" width="200" height="200">'
-    const image = document.getElementById('a') as HTMLImageElement
-    // Already classified nsfw and hidden, so the initial sweep skips it and no
-    // background prediction is needed for this test.
-    image.dataset.nsfwFilterStatus = 'nsfw'
-    image.style.visibility = 'hidden'
-
-    const filter = new ImageFilter()
-    filter.setSettings({ filterEffect: 'hide' })
-    new DOMWatcher(filter, makeVideoFilter(), makeBackgroundFilter()).watch()
-
-    image.setAttribute('style', 'visibility: visible')
-    await flushMutations()
-
-    expect(image.style.visibility).toBe('hidden')
-  })
-})
-
-// A background can be selected by what is around an element rather than by the
-// element itself, so what changed is not always what has to be re-read.
-describe('content => DOMWatcher => cascade changes', () => {
-  test('re-reads the parent of an inserted sibling', async () => {
-    document.body.innerHTML = '<div id="list"><div id="card"></div></div>'
-    const background = makeBackgroundFilter()
-    new DOMWatcher(makeFilter(), makeVideoFilter(), background).watch()
-
-    document.getElementById('list')?.prepend(document.createElement('div'))
-    await flushMutations()
-
-    expect(background.checkElement).toHaveBeenCalledWith(document.getElementById('list'))
+describe('content => DOMWatcher => background images', () => {
+  beforeEach(() => {
+    jest.useFakeTimers()
+    document.head.innerHTML = ''
+    document.body.innerHTML = ''
+    invalidateSelectorCache()
   })
 
-  test('re-reads what is on screen when a stylesheet is removed', async () => {
-    document.body.innerHTML = '<style id="sheet"></style>'
-    const background = makeBackgroundFilter()
-    new DOMWatcher(makeFilter(), makeVideoFilter(), background).watch()
-    ;(background.recheckVisible as jest.Mock).mockClear()
-
-    document.getElementById('sheet')?.remove()
-    await flushMutations()
-
-    expect(background.recheckVisible).toHaveBeenCalled()
-  })
-})
-
-describe('content => DOMWatcher => stylesheet registrations', () => {
-  test('re-reads what is on screen when a wrapper holding a stylesheet is removed', async () => {
-    document.body.innerHTML = '<div id="wrapper"><style></style></div>'
-    const background = makeBackgroundFilter()
-    new DOMWatcher(makeFilter(), makeVideoFilter(), background).watch()
-    ;(background.recheckVisible as jest.Mock).mockClear()
-
-    document.getElementById('wrapper')?.remove()
-    await flushMutations()
-
-    expect(background.recheckVisible).toHaveBeenCalled()
+  afterEach(() => {
+    jest.useRealTimers()
   })
 
-  test('re-reads what is on screen when an id change brings in a new rule', async () => {
-    document.body.innerHTML = '<div id="card"></div>'
-    const background = makeBackgroundFilter()
-    new DOMWatcher(makeFilter(), makeVideoFilter(), background).watch()
+  test('reports a background already on the page when watching started', async () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    const backgroundFilter = buildBackgroundFilter()
+    document.body.innerHTML = '<div style="background-image: url(https://cdn.test/a.jpg)"></div>'
+    sizeAll('div')
 
-    const card = document.getElementById('card') as HTMLElement
-    card.id = 'other'
-    await flushMutations()
+    new DOMWatcher(imageFilter, videoFilter, {
+      filter: backgroundFilter, mode: 'inline', minSize: 41
+    }).watch()
+    await settle()
 
-    expect(background.checkElement).toHaveBeenCalledWith(card)
+    expect(scanned(backgroundFilter)).toEqual(['https://cdn.test/a.jpg'])
   })
 
-  // A page that mounts a style per render leaves one observer per unmount unless
-  // the removal takes it with it.
-  test('stops watching a stylesheet the page removed', async () => {
-    document.body.innerHTML = '<style id="sheet"></style>'
-    const background = makeBackgroundFilter()
-    new DOMWatcher(makeFilter(), makeVideoFilter(), background).watch()
+  test('reports a background painted onto an element after watching started', async () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    const backgroundFilter = buildBackgroundFilter()
+    document.body.innerHTML = '<div id="slide"></div>'
+    sizeAll('div')
 
-    const sheet = document.getElementById('sheet') as HTMLElement
-    sheet.remove()
-    await flushMutations()
-    ;(background.recheckVisible as jest.Mock).mockClear()
+    new DOMWatcher(imageFilter, videoFilter, {
+      filter: backgroundFilter, mode: 'inline', minSize: 41
+    }).watch()
+    await settle()
 
-    sheet.textContent = '.card { background-image: url("http://example.com/a.jpg") }'
-    await flushMutations()
+    // The shape element recycling produces: one element, repainted in place.
+    const slide = document.querySelector('#slide') as HTMLElement
+    slide.setAttribute('style', 'background-image: url(https://cdn.test/late.jpg)')
+    sizeAll('div')
+    await settle()
 
-    expect(background.recheckVisible).not.toHaveBeenCalled()
+    expect(scanned(backgroundFilter)).toContain('https://cdn.test/late.jpg')
   })
 
-  // Each <style> carries its own observer, so a pause that left them running
-  // would keep answering for a filter that is meant to be idle.
-  test('stops watching stylesheets when watching stops', async () => {
-    document.body.innerHTML = '<style id="sheet"></style>'
-    const background = makeBackgroundFilter()
-    const watcher = new DOMWatcher(makeFilter(), makeVideoFilter(), background)
-    watcher.watch()
-    watcher.unwatch()
-    ;(background.recheckVisible as jest.Mock).mockClear()
+  test('coalesces a burst of mutations into a single scan', async () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    const backgroundFilter = buildBackgroundFilter()
 
-    const sheet = document.getElementById('sheet') as HTMLElement
-    sheet.textContent = '.card { background-image: url("http://example.com/a.jpg") }'
-    await flushMutations()
+    new DOMWatcher(imageFilter, videoFilter, {
+      filter: backgroundFilter, mode: 'inline', minSize: 41
+    }).watch()
+    await settle()
 
-    expect(background.recheckVisible).not.toHaveBeenCalled()
+    const before = (backgroundFilter.analyzeCandidates as jest.Mock).mock.calls.length
+    for (let i = 0; i < 10; i++) {
+      const node = document.createElement('div')
+      node.setAttribute('style', `background-image: url(https://cdn.test/burst-${i}.jpg)`)
+      document.body.appendChild(node)
+    }
+    sizeAll('div')
+    await settle()
+
+    expect((backgroundFilter.analyzeCandidates as jest.Mock).mock.calls.length).toBe(before + 1)
+    expect(scanned(backgroundFilter)).toContain('https://cdn.test/burst-9.jpg')
+  })
+
+  test('does nothing about backgrounds when the scan is off', async () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    const backgroundFilter = buildBackgroundFilter()
+    document.body.innerHTML = '<div style="background-image: url(https://cdn.test/a.jpg)"></div>'
+    sizeAll('div')
+
+    new DOMWatcher(imageFilter, videoFilter, {
+      filter: backgroundFilter, mode: 'off', minSize: 41
+    }).watch()
+    await settle()
+
+    expect(backgroundFilter.analyzeCandidates).not.toHaveBeenCalled()
+  })
+
+  test('still analyzes tagged media when the background scan is off', async () => {
+    const { imageFilter, videoFilter } = buildFilters()
+    const image = document.createElement('img')
+    image.src = 'https://cdn.test/a.jpg'
+    document.body.appendChild(image)
+
+    new DOMWatcher(imageFilter, videoFilter, {
+      filter: buildBackgroundFilter(), mode: 'off', minSize: 41
+    }).watch()
+
+    expect(imageFilter.analyzeImage).toHaveBeenCalledWith(image, false)
   })
 })

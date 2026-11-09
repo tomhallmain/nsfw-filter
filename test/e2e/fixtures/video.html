@@ -9,7 +9,7 @@
   <video id="plain" src="/video.webm" width="320" height="240" muted playsinline></video>
   <!-- A poster is an ordinary image, classified before playback starts. -->
   <video id="postered" src="/video.webm" poster="/icon.png" width="320" height="240" muted playsinline></video>
-  <!-- Below MIN_VIDEO_SIZE: tagged and left alone. -->
+  <!-- Below MIN_VIDEO_SIZE: left untagged and alone. -->
   <video id="tiny" src="/video.webm" width="20" height="20" muted playsinline></video>
   <!-- Same bytes from another host, so the canvas is tainted and no frame can be
        read back. Served without CORS headers on purpose. -->
