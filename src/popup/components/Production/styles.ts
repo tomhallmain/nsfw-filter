@@ -176,3 +176,57 @@ export const AdvancedRow = styled.div`
   display: flex;
   justify-content: space-between;
 `
+
+export const Hint = styled.span`
+  color: ${props => props.theme.text.secondary};
+  font-size: 12px;
+`
+
+export const RevealButton = styled.button`
+  background: none;
+  border: 1px solid ${props => props.theme.border};
+  border-radius: 8px;
+  color: ${props => props.theme.text.primary};
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  width: 100%;
+
+  &:hover {
+    border-color: ${props => props.theme.accent};
+  }
+`
+
+export const SectionTitle = styled.span`
+  color: ${props => props.theme.text.secondary};
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+`
+
+export const TuningGrid = styled.div`
+  align-items: center;
+  display: grid;
+  gap: 6px 8px;
+  grid-template-columns: 1fr 88px;
+
+  .ant-input-number {
+    width: 88px;
+  }
+`
+
+export const TuningLabel = styled.span`
+  color: ${props => props.theme.text.primary};
+  font-size: 12px;
+`
+
+export const Warning = styled.div`
+  border: 1px solid rgba(225, 29, 72, 0.5);
+  border-radius: 8px;
+  color: ${props => props.theme.text.primary};
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 6px 8px;
+`
