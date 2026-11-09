@@ -3,7 +3,7 @@ import { DEFAULT_CLASSIFIER_BACKEND, isClassifierBackend } from '../../utils/mod
 
 import { AutoDlSession } from './autoDlFrames'
 import { ClassifierBackend, ClassifierSettings, MediaClassifier } from './MediaClassifier'
-import { NsfwjsMediaClassifier } from './NsfwjsMediaClassifier'
+import { NsfwjsMediaClassifier, VIT_MODEL_SPEC } from './NsfwjsMediaClassifier'
 import { OnnxMediaClassifier } from './OnnxMediaClassifier'
 
 export const createClassifier = (
@@ -14,6 +14,9 @@ export const createClassifier = (
 ): MediaClassifier => {
   if (backend === 'onnx') {
     return new OnnxMediaClassifier(logger, settings, autoDl)
+  }
+  if (backend === 'vit') {
+    return new NsfwjsMediaClassifier(logger, settings, autoDl, VIT_MODEL_SPEC)
   }
   return new NsfwjsMediaClassifier(logger, settings, autoDl)
 }

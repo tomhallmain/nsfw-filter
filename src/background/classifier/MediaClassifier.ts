@@ -1,6 +1,7 @@
 /**
  * Backend-agnostic classifier boundary for the offscreen document.
- * Implementations: NsfwjsMediaClassifier (TF.js), OnnxMediaClassifier (ORT Web).
+ * Implementations: NsfwjsMediaClassifier (TF.js; MobileNet or ViT weights),
+ * OnnxMediaClassifier (ORT Web).
  */
 
 import { ClassifierBackend } from '../../utils/models'

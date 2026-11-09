@@ -1,10 +1,12 @@
 import { enableProdMode } from '@tensorflow/tfjs-core'
+import { loadGraphModel } from '@tensorflow/tfjs-converter'
 import { load as loadNsfwjs } from 'nsfwjs/core'
 
 import { ILogger } from '../../utils/Logger'
 import { withTimeout } from '../../utils/messages'
 import { FrameModel, Model, ModelSettings } from '../Model'
 import { getModelPath, setupTfBackend } from '../setupTfBackend'
+import { VIT_INPUT_SIZE, VIT_MODEL_PATH, ViTModel } from '../ViTModel'
 
 import {
   computeSampleIndices,
@@ -54,7 +56,7 @@ const defaultSampling = (): SamplingConfig & {
 
 /** Which TF.js weights a NsfwjsMediaClassifier runs, and how to load them. */
 export type TfModelSpec = {
-  backend: Extract<ClassifierBackend, 'nsfwjs'>
+  backend: Extract<ClassifierBackend, 'nsfwjs' | 'vit'>
   /** Recorded in auto-DL metadata. */
   label: string
   imageSize: number
@@ -70,6 +72,16 @@ export const NSFWJS_MODEL_SPEC: TfModelSpec = {
   load: async (logger, settings) => {
     const nsfwjs = await loadNsfwjs(getModelPath(), { size: NSFWJS_IMAGE_SIZE, type: 'graph' })
     return new Model(nsfwjs, logger, settings)
+  }
+}
+
+export const VIT_MODEL_SPEC: TfModelSpec = {
+  backend: 'vit',
+  label: `Marqo ViT-Tiny (${VIT_INPUT_SIZE}px)`,
+  imageSize: VIT_INPUT_SIZE,
+  load: async (logger, settings) => {
+    const graph = await loadGraphModel(chrome.runtime.getURL(VIT_MODEL_PATH))
+    return new ViTModel(graph, logger, settings)
   }
 }
 
