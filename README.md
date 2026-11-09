@@ -1,13 +1,15 @@
 # <img src="demo/images/logo-mark.svg" width="34" align="middle" alt=""> NSFW Filter
 
 > [!NOTE]
-> v3.0.0 released! See the release notes here: https://nsfwfilter.com/news/v3.0.0
+> This is a fork of [nsfw-filter/nsfw-filter](https://github.com/nsfw-filter/nsfw-filter). It adds video and GIF
+> frame sampling, CSS background filtering, page-wide protection, a text filter, and a custom ONNX classifier
+> option. The Chrome Web Store links below install the upstream extension; this fork installs [from source](#development).
 
 A free, open source, and privacy-focused browser extension to block "not safe for work" content.
 
 Images are classified on your device with TensorFlow.js. Nothing is uploaded, and no data leaves your browser.
 
-NSFW Filter ships two models you can switch between in the popup: a small, accurate Vision Transformer (ViT-384) that classifies images as safe or not safe (the default), and the original [NSFWJS](https://github.com/infinitered/nsfwjs) MobileNet model.
+You can switch classifiers in the popup: the original [NSFWJS](https://github.com/infinitered/nsfwjs) MobileNet model (the default), a small Vision Transformer (ViT-384) that classifies images as safe or not safe, or your own model exported to ONNX (see `dist/models/onnx/README.md`).
 
 Download now for [Google Chrome](https://chrome.google.com/webstore/detail/nsfw-filter/kmgagnlkckiamnenbpigfaljmanlbbhh).
 
@@ -19,7 +21,14 @@ You can install the extension from the [Chrome Web Store](https://chrome.google.
 
 When you load web pages, NSFW Filter will first hide all images and only show those classified as safe.
 
-Click the icon in your extensions tab to open the popup. From there you can turn protection on or off, adjust how strict the filter is, choose how flagged images are handled (blur, grayscale, or hide), pick which model does the classifying, and allow specific sites.
+Click the icon in your extensions tab to open the popup. From there you can turn protection on or off, adjust how strict the filter is, choose how flagged images are handled (blur, grayscale, or hide), turn page-wide protection on or off, and allow the current site. The **Advanced** section picks the classifier and tunes video/GIF sampling. The options page manages allowed sites and the text filter.
+
+Beyond `<img>` elements, NSFW Filter also checks:
+
+- **Videos and GIFs**: a bounded set of frames is sampled across the media (by default up to 45 seconds, 2-10 frames); a video stays in a "Checking media..." state until a verdict arrives, and is muted if flagged. Live streams with no finite duration get a single-frame check.
+- **CSS background images**, including `::before`/`::after` backgrounds and elements inside shadow roots.
+- **Whole pages**: with page-wide protection on, once enough of a page's media is flagged, the rest of the page is filtered too. "Show this page anyway" in the popup undoes it for the current view.
+- **Text**: words, phrases, or regular expressions you list are replaced with `[filtered]`.
 
 ![NSFW Filter popup](demo/images/popup-window.png)
 
