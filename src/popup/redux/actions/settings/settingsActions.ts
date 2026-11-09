@@ -12,7 +12,8 @@ import {
   SET_DYNAMIC_MEDIA_SETTINGS,
   SET_INTER_IMAGE_AWARENESS,
   SET_BACKGROUND_SCAN_MODE,
-  SET_AUTO_DL_FRAMES
+  SET_AUTO_DL_FRAMES,
+  SET_TEXT_FILTER
 } from './settingsTypes'
 
 export const toggleLogging = () => ({ type: TOGGLE_LOGGING } as const)
@@ -80,4 +81,16 @@ export const setAutoDlFrames = (
 ) => ({
   type: SET_AUTO_DL_FRAMES,
   payload: autoDlFrames
+} as const)
+
+export const setTextFilter = (
+  textFilter: {
+    textFilterEnabled?: boolean
+    textFilterWords?: string[]
+    textFilterPatterns?: string[]
+    textFilterCaseSensitive?: boolean
+  }
+) => ({
+  type: SET_TEXT_FILTER,
+  payload: textFilter
 } as const)

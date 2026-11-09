@@ -1,4 +1,4 @@
-import { setAutoDlFrames, setBackgroundScanMode, setInterImageAwareness } from '../../src/popup/redux/actions/settings'
+import { setAutoDlFrames, setBackgroundScanMode, setInterImageAwareness, setTextFilter } from '../../src/popup/redux/actions/settings'
 import { settings } from '../../src/popup/redux/reducers/settings'
 import { SettingsActionTypes } from '../../src/popup/redux/actions/settings'
 
@@ -79,4 +79,31 @@ describe('popup => settings reducer', () => {
     expect(tuned.autoDlMaxPairsPerSession).toBe(20)
   })
 
+  test('the text filter ships off and empty, and stays so for state saved before it existed', () => {
+    const state = initial()
+    expect(state.textFilterEnabled).toBe(false)
+    expect(state.textFilterWords).toEqual([])
+    expect(state.textFilterPatterns).toEqual([])
+    expect(state.textFilterCaseSensitive).toBe(false)
+
+    const stale = { ...initial() } as Partial<ReturnType<typeof settings>>
+    delete stale.textFilterEnabled
+    delete stale.textFilterWords
+    delete stale.textFilterPatterns
+    delete stale.textFilterCaseSensitive
+    const hydrated = settings(stale as ReturnType<typeof settings>, { type: '@@INIT' } as unknown as SettingsActionTypes)
+    expect(hydrated.textFilterEnabled).toBe(false)
+    expect(hydrated.textFilterWords).toEqual([])
+    expect(hydrated.textFilterPatterns).toEqual([])
+  })
+
+  test('text filter fields can be set without disturbing each other', () => {
+    const on = settings(initial(), setTextFilter({ textFilterEnabled: true }))
+    const saved = settings(on, setTextFilter({ textFilterWords: ['bad'], textFilterPatterns: ['wor+d'] }))
+
+    expect(saved.textFilterEnabled).toBe(true)
+    expect(saved.textFilterWords).toEqual(['bad'])
+    expect(saved.textFilterPatterns).toEqual(['wor+d'])
+    expect(saved.textFilterCaseSensitive).toBe(false)
+  })
 })

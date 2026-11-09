@@ -9,6 +9,7 @@ import { SettingsState } from '../../popup/redux/reducers/settings'
 import { isHostAllowed, normalizeHostEntry } from '../../utils/allowlist'
 
 import { Wrap, Title, Sub, AddRow, ListCard, Row, Host, Remove, EmptyNote } from './styles'
+import { TextFilterSettings } from './TextFilterSettings'
 
 export const Options: React.FC = () => {
   const dispatch = useDispatch()
@@ -58,6 +59,8 @@ export const Options: React.FC = () => {
             </Row>
           ))}
       </ListCard>
+
+      <TextFilterSettings />
     </Wrap>
   )
 }

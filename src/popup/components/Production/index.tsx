@@ -242,7 +242,7 @@ export const Production: React.FC = () => {
 
         <AllowSiteField />
         <ManageLink onClick={() => chrome.runtime.openOptionsPage()}>
-          Manage allowed sites
+          Manage allowed sites and text filter
         </ManageLink>
       </Card>
 

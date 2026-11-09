@@ -2,6 +2,7 @@ import { createStore } from 'redux'
 
 import { createChromeStore } from '../popup/redux/chrome-storage'
 import { rootReducer } from '../popup/redux/reducers'
+import { SettingsState } from '../popup/redux/reducers/settings'
 import { isHostAllowed } from '../utils/allowlist'
 import {
   CONTEXT_TARGET,
@@ -16,6 +17,8 @@ import { DOMWatcher } from './DOMWatcher/DOMWatcher'
 import { BackgroundFilter } from './Filter/BackgroundFilter'
 import { ImageFilter } from './Filter/ImageFilter'
 import { PageTally } from './Filter/pageSensitivity'
+import { compileTextEntries, createRegexMatcher } from './Filter/textMatch'
+import { filterPageTextWhenParsed } from './Filter/textPass'
 import { VideoFilter } from './Filter/VideoFilter'
 
 /**
@@ -85,6 +88,21 @@ const wireRevealSwept = (imageFilter: ImageFilter, backgroundFilter: BackgroundF
   })
 }
 
+// Entries that no longer compile (saved before validation existed, or edited
+// in storage directly) are skipped so the rest still run.
+const startTextFilter = (settings: SettingsState): void => {
+  const { textFilterEnabled, textFilterWords, textFilterPatterns, textFilterCaseSensitive } = settings
+  if (!textFilterEnabled) return
+
+  const words = compileTextEntries(textFilterWords, 'word', textFilterCaseSensitive)
+  const patterns = compileTextEntries(textFilterPatterns, 'regex', textFilterCaseSensitive)
+  words.errors.forEach(({ index, message }) => console.warn(`Text filter word ${index + 1} skipped: ${message}`))
+  patterns.errors.forEach(({ index, message }) => console.warn(`Text filter pattern ${index + 1} skipped: ${message}`))
+
+  const regexes = [...words.regexes, ...patterns.regexes]
+  if (regexes.length > 0) filterPageTextWhenParsed(createRegexMatcher(regexes))
+}
+
 const init = (): void => {
   // One tally per page view, shared so blocked video counts toward the same
   // threshold blocked images do.
@@ -142,6 +160,7 @@ const init = (): void => {
       const allowed = isHostAllowed(window.location.hostname, websites)
       if (enabled && !allowed) {
         domWatcher.watch()
+        startTextFilter(settings)
       }
     })
     .catch(error => {

@@ -74,3 +74,63 @@ export const EmptyNote = styled.div`
   padding: 24px 16px;
   text-align: center;
 `
+
+export const Section = styled.section`
+  margin-top: 40px;
+`
+
+export const SectionHead = styled.div`
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+`
+
+export const SectionTitle = styled.h2`
+  color: ${props => props.theme.text.primary};
+  font-size: 18px;
+  font-weight: 700;
+  margin: 0;
+`
+
+export const FieldCard = styled.div`
+  background-color: ${props => props.theme.bg.surface};
+  border: 1px solid ${props => props.theme.border};
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+`
+
+export const FieldLabel = styled.label`
+  color: ${props => props.theme.text.primary};
+  font-size: 14px;
+  font-weight: 500;
+  margin-top: 4px;
+`
+
+export const ErrorText = styled.span`
+  color: rgb(225, 29, 72);
+  font-size: 13px;
+`
+
+export const HintText = styled.span`
+  color: ${props => props.theme.text.secondary};
+  font-size: 13px;
+`
+
+export const Actions = styled.div`
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-top: 8px;
+`
+
+export const Inline = styled.span`
+  align-items: center;
+  color: ${props => props.theme.text.secondary};
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+`

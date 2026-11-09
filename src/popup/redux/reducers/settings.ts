@@ -11,7 +11,8 @@ import {
   SET_DYNAMIC_MEDIA_SETTINGS,
   SET_INTER_IMAGE_AWARENESS,
   SET_BACKGROUND_SCAN_MODE,
-  SET_AUTO_DL_FRAMES
+  SET_AUTO_DL_FRAMES,
+  SET_TEXT_FILTER
 } from '../actions/settings/settingsTypes'
 
 export type SettingsState = {
@@ -36,6 +37,10 @@ export type SettingsState = {
   autoDlSignatureThreshold: number
   autoDlMaxPairsPerVideo: number
   autoDlMaxPairsPerSession: number
+  textFilterEnabled: boolean
+  textFilterWords: string[]
+  textFilterPatterns: string[]
+  textFilterCaseSensitive: boolean
 }
 
 const initialState: SettingsState = {
@@ -67,7 +72,12 @@ const initialState: SettingsState = {
   autoDlFramesEnabled: false,
   autoDlSignatureThreshold: 0.5,
   autoDlMaxPairsPerVideo: 3,
-  autoDlMaxPairsPerSession: 20
+  autoDlMaxPairsPerSession: 20,
+  textFilterEnabled: false,
+  textFilterWords: [],
+  // Regex sources, compiled as typed.
+  textFilterPatterns: [],
+  textFilterCaseSensitive: false
 }
 
 export function settings (state = initialState, action: SettingsActionTypes): SettingsState {
@@ -100,6 +110,8 @@ export function settings (state = initialState, action: SettingsActionTypes): Se
     case SET_INTER_IMAGE_AWARENESS:
       return { ...s, ...action.payload }
     case SET_AUTO_DL_FRAMES:
+      return { ...s, ...action.payload }
+    case SET_TEXT_FILTER:
       return { ...s, ...action.payload }
     case SET_BACKGROUND_SCAN_MODE:
       return { ...s, backgroundScanMode: action.payload.backgroundScanMode }
